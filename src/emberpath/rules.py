@@ -15,6 +15,9 @@ same evidence format works for every rule:
     spread_prob:<material>   chance fire jumps from a burning cell to a neighbor of this material, per tick
     follow_prob:<kind>       chance a bonded dependent (dog/spouse/child) manages to follow, per allowed tick
     door_jammed:<r>,<c>      1.0 if that door cannot be opened, else 0.0
+    occupied:<r>,<c>         1.0 if an UNEXPECTED dependent (not in the declared household) is at that cell, else 0.0
+
+door_jammed and occupied are the BOOLEAN_FAMILIES: near-deterministic, patched with True/False.
 """
 
 from __future__ import annotations
@@ -28,6 +31,7 @@ DEPENDENT_KINDS = ("dog", "spouse", "child")
 DEFAULT_SPREAD = {"wood": 0.10, "carpet": 0.16, "tile": 0.02, "door": 0.07}
 DEFAULT_FOLLOW = {"dog": 0.70, "spouse": 0.95, "child": 0.90}
 DEFAULT_BURN_STEPS = 10
+BOOLEAN_FAMILIES = ("door_jammed", "occupied")
 
 
 def parse_key(key: str) -> tuple[str, str]:
@@ -39,11 +43,11 @@ def parse_key(key: str) -> tuple[str, str]:
         return family, name
     if family == "follow_prob" and name in DEPENDENT_KINDS:
         return family, name
-    if family == "door_jammed":
+    if family in BOOLEAN_FAMILIES:
         try:
             r, c = (int(x) for x in name.split(","))
         except ValueError as exc:
-            raise ValueError(f"bad door key {key!r}") from exc
+            raise ValueError(f"bad cell key {key!r}") from exc
         return family, f"{r},{c}"
     raise ValueError(f"unknown rule key {key!r}")
 
@@ -52,12 +56,23 @@ def door_key(cell: tuple[int, int]) -> str:
     return f"door_jammed:{cell[0]},{cell[1]}"
 
 
-def door_cell(key: str) -> tuple[int, int]:
+def occupied_key(cell: tuple[int, int]) -> str:
+    return f"occupied:{cell[0]},{cell[1]}"
+
+
+def key_cell(key: str) -> tuple[int, int]:
+    """The cell a boolean-family key refers to."""
     family, name = parse_key(key)
-    if family != "door_jammed":
-        raise ValueError(f"{key!r} is not a door key")
+    if family not in BOOLEAN_FAMILIES:
+        raise ValueError(f"{key!r} is not a cell key")
     r, c = (int(x) for x in name.split(","))
     return (r, c)
+
+
+def door_cell(key: str) -> tuple[int, int]:
+    if parse_key(key)[0] != "door_jammed":
+        raise ValueError(f"{key!r} is not a door key")
+    return key_cell(key)
 
 
 @dataclass(frozen=True)
@@ -69,9 +84,9 @@ class RulePatch:
 
     def __post_init__(self) -> None:
         family, _ = parse_key(self.key)
-        if family == "door_jammed":
+        if family in BOOLEAN_FAMILIES:
             if not isinstance(self.value, (bool, int)) or self.value not in (0, 1):
-                raise ValueError("door_jammed patches take True/False")
+                raise ValueError(f"{family} patches take True/False")
         else:
             if isinstance(self.value, bool) or not 0.0 <= float(self.value) <= 1.0:
                 raise ValueError(f"{self.key} needs a probability in [0, 1]")
@@ -82,6 +97,7 @@ class Rules:
     spread_prob: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_SPREAD))
     follow_prob: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_FOLLOW))
     jammed_doors: frozenset[tuple[int, int]] = frozenset()
+    occupied: frozenset[tuple[int, int]] = frozenset()  # cells holding an unexpected dependent
     burn_steps: int = DEFAULT_BURN_STEPS
 
     def prob(self, key: str) -> float:
@@ -91,7 +107,8 @@ class Rules:
             return self.spread_prob[name]
         if family == "follow_prob":
             return self.follow_prob[name]
-        return 1.0 if door_cell(key) in self.jammed_doors else 0.0
+        cells = self.jammed_doors if family == "door_jammed" else self.occupied
+        return 1.0 if key_cell(key) in cells else 0.0
 
     def with_patch(self, patch: RulePatch) -> "Rules":
         family, name = parse_key(patch.key)
@@ -99,10 +116,11 @@ class Rules:
             return replace(self, spread_prob={**self.spread_prob, name: float(patch.value)})
         if family == "follow_prob":
             return replace(self, follow_prob={**self.follow_prob, name: float(patch.value)})
-        cell = door_cell(patch.key)
-        doors = set(self.jammed_doors)
-        doors.add(cell) if patch.value else doors.discard(cell)
-        return replace(self, jammed_doors=frozenset(doors))
+        field_name = "jammed_doors" if family == "door_jammed" else "occupied"
+        cells = set(getattr(self, field_name))
+        cell = key_cell(patch.key)
+        cells.add(cell) if patch.value else cells.discard(cell)
+        return replace(self, **{field_name: frozenset(cells)})
 
     def with_patches(self, patches: list[RulePatch] | tuple[RulePatch, ...]) -> "Rules":
         out = self
@@ -123,6 +141,8 @@ class Rules:
         for d in check:
             if (d in self.jammed_doors) != (d in other.jammed_doors):
                 patches.append(RulePatch(door_key(d), d in other.jammed_doors))
+        for c in sorted(self.occupied ^ other.occupied):
+            patches.append(RulePatch(occupied_key(c), c in other.occupied))
         return patches
 
 
