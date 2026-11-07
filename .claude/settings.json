@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest:*)",
+      "Bash(python -m emberpath:*)",
+      "Bash(emberpath:*)",
+      "Bash(make test:*)",
+      "Bash(make test-fast:*)",
+      "Bash(make audit:*)",
+      "Bash(make results:*)",
+      "Bash(make demo:*)",
+      "Bash(python scripts/:*)",
+      "Bash(pip install -e:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)"
+    ]
+  }
+}
