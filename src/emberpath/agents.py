@@ -1,9 +1,10 @@
-"""Three agents, one interface.
+"""Four agents, one interface.
 
 baseline  plans with the textbook rules and never updates them. Hurt by novelty.
 oracle    plans with the TRUE rules at every tick (cheating). Upper bound on what any
           adaptive agent could achieve with this planner.
-adaptive  YOUR agent: baseline + detector + repairer. Closes the gap between the two.
+adaptive  baseline + detector + repairer: learns the changed rules from evidence alone.
+naive_repair  ablation: detector, but flagged rules jump to their posterior mean (no search).
 
 The headline metric for the whole project:
 
@@ -12,14 +13,16 @@ The headline metric for the whole project:
 
 from __future__ import annotations
 
+import math
+from dataclasses import replace
 from typing import Protocol
 
 from emberpath.blueprint import Blueprint
-from emberpath.explain import DecisionLog
-from emberpath.novelty import BetaBernoulliDetector, NoveltyDetector
+from emberpath.explain import DecisionLog, describe_patch
+from emberpath.novelty import BetaBernoulliDetector, Finding, NoveltyDetector
 from emberpath.planner import Decision, HazardAwarePlanner
-from emberpath.repair import RepairSearch
-from emberpath.rules import Rules, RulePatch, nominal_rules
+from emberpath.repair import RepairResult, RepairSearch
+from emberpath.rules import BOOLEAN_FAMILIES, Rules, RulePatch, key_cell, nominal_rules, parse_key
 from emberpath.world import Event, Observation, World
 
 
@@ -43,6 +46,7 @@ class BaselineAgent:
 
 class OracleAgent:
     name = "oracle"
+    privileged = True  # the only agent make_agent hands the true world to
 
     def __init__(self, blueprint: Blueprint, world: World):
         self.world = world
@@ -53,8 +57,32 @@ class OracleAgent:
         return self.planner.act(obs)
 
 
+class Repairer(Protocol):
+    def repair(self, belief: Rules, findings: list[Finding], events: list[Event]) -> RepairResult: ...
+
+
+class PosteriorMeanRepair:
+    """Ablation: no search. Set every flagged rule to the detector's posterior mean (booleans: round it)."""
+
+    def repair(self, belief: Rules, findings: list[Finding], events: list[Event]) -> RepairResult:
+        patches = [
+            RulePatch(f.key, f.posterior_mean > 0.5 if parse_key(f.key)[0] in BOOLEAN_FAMILIES else f.posterior_mean)
+            for f in findings
+        ]
+        return RepairResult(belief.with_patches(patches), patches, math.nan, math.inf)
+
+
 class AdaptiveAgent:
-    """Phase 5 wiring. Works as soon as the detector and repairer are implemented."""
+    """Baseline planner + detector + repairer.
+
+    Every tick: feed the new events to the detector; if it reports a *fresh* finding (a flagged key
+    with evidence the repairer has not yet seen), repair the belief from the whole event history,
+    hand the repaired belief to the same planner, and re-baseline the detector so it measures
+    surprise against the new belief. Ticks without fresh findings cost one detector update.
+
+    "Fresh" is per (key, amount of evidence), not per key: a rule that changes again, or changes
+    back, is re-flagged by the detector after the re-baseline and gets repaired again.
+    """
 
     name = "adaptive"
 
@@ -63,38 +91,86 @@ class AdaptiveAgent:
         blueprint: Blueprint,
         world: World | None = None,
         detector: NoveltyDetector | None = None,
-        repairer: RepairSearch | None = None,
+        repairer: Repairer | None = None,
+        belief: Rules | None = None,  # start from beliefs learned in earlier episodes (see `lessons`)
     ):
-        self.belief: Rules = nominal_rules()
+        self.belief: Rules = belief or nominal_rules()
         self.planner = HazardAwarePlanner(blueprint, self.belief)
         self.detector = detector or BetaBernoulliDetector(self.belief)
         self.repairer = repairer or RepairSearch()
         self.all_events: list[Event] = []
         self.patches: list[tuple[int, RulePatch]] = []  # (step, patch) history
+        self.repairs = 0  # repair calls made (cost accounting)
         self.log = DecisionLog()
-        self._handled: set[str] = set()
+        self._seen: dict[str, int] = {}  # key -> evidence count when the repairer last looked at it
+        self._dismissed: set[tuple[str, float]] = set()  # (key, believed) surprises judged to be bad luck
 
     def act(self, obs: Observation, events: list[Event]) -> Decision:
-        self.all_events.extend(events)
-        self.detector.observe(events)
-        fresh = [f for f in self.detector.findings() if f.key not in self._handled]
-        if fresh:
-            result = self.repairer.repair(self.belief, fresh, self.all_events)
-            self.belief = result.rules
-            self.planner.belief = self.belief
-            self.detector.reset_belief(self.belief)
-            self._handled.update(f.key for f in fresh)
-            self.patches.extend((obs.step, p) for p in result.patches)
+        note = ""
+        if events:  # findings can only change when evidence arrives
+            self.all_events.extend(events)
+            self.detector.observe(events)
+            findings = self.detector.findings()
+            if any(f.n_trials > self._seen.get(f.key, 0) for f in findings):
+                note = self._repair(obs.step, findings)
         decision = self.planner.act(obs)
+        if note:
+            decision = replace(decision, reason=f"{note} {decision.reason}")
         self.log.add(obs.step, decision)
         return decision
 
+    def _repair(self, step: int, findings: list[Finding]) -> str:
+        """Repair the belief from every current finding; return what to tell the human."""
+        self.repairs += 1
+        self._seen.update((f.key, f.n_trials) for f in findings)
+        before = self.belief
+        result = self.repairer.repair(before, findings, self.all_events)
+        if not result.patches:  # say so once per (rule, belief), not on every further surprising tick
+            new = {(f.key, f.believed) for f in findings} - self._dismissed
+            self._dismissed |= new
+            return "Something surprised me, but it looks like bad luck; keeping my beliefs." if new else ""
+        self.belief = self.planner.belief = result.rules
+        self.detector.reset_belief(self.belief)
+        self.patches.extend((step, p) for p in result.patches)
+        changed = " ".join(describe_patch(p, before) for p in result.patches)
+        if not result.ambiguous:
+            return f"Updating my beliefs: {changed}"
+        alt = " ".join(describe_patch(p, before) for p in result.runner_up) or "nothing has changed (bad luck)"
+        return (
+            f"I think this changed: {changed} But \"{alt}\" would explain what I saw almost as well "
+            f"(margin {result.runner_up_margin:.1f}); acting on my best guess."
+        )
 
-AGENTS = {"baseline": BaselineAgent, "oracle": OracleAgent, "adaptive": AdaptiveAgent}
+
+    def lessons(self) -> Rules:
+        """What to carry into the next episode in the same house: the final belief, except that a hiding place
+        where someone was heard stays occupied. `occupied` means "someone hides here when the fire starts"; the
+        silence after they have been found and led away says nothing against that, but the repair search reads
+        it as the rule reverting."""
+        heard = {key_cell(p.key) for _, p in self.patches if parse_key(p.key)[0] == "occupied" and p.value}
+        return replace(self.belief, occupied=self.belief.occupied | heard)
+
+
+class NaiveRepairAgent(AdaptiveAgent):
+    """Ablation: detector, but no repair search (flagged rules jump to their posterior mean)."""
+
+    name = "naive_repair"
+
+    def __init__(self, blueprint: Blueprint, world: World | None = None):
+        super().__init__(blueprint, repairer=PosteriorMeanRepair())
+
+
+AGENTS = {
+    "baseline": BaselineAgent,
+    "oracle": OracleAgent,
+    "adaptive": AdaptiveAgent,
+    "naive_repair": NaiveRepairAgent,
+}
 
 
 def make_agent(name: str, blueprint: Blueprint, world: World) -> Agent:
-    try:
-        return AGENTS[name](blueprint, world)
-    except KeyError:
-        raise ValueError(f"unknown agent {name!r}; choose from {sorted(AGENTS)}") from None
+    if name not in AGENTS:
+        raise ValueError(f"unknown agent {name!r}; choose from {sorted(AGENTS)}")
+    cls = AGENTS[name]
+    # Evidence discipline by construction: only privileged agents ever receive the world (and its true rules).
+    return cls(blueprint, world if getattr(cls, "privileged", False) else None)

@@ -10,8 +10,8 @@ from typing import Callable
 
 from emberpath.blueprint import Blueprint
 from emberpath.dependents import Household
-from emberpath.grid import Cell
-from emberpath.rules import RulePatch, door_key
+from emberpath.grid import Cell, neighbors4
+from emberpath.rules import RulePatch, door_key, occupied_key
 from emberpath.world import NoveltySpec
 
 
@@ -23,17 +23,9 @@ def _shortest_path(bp: Blueprint, src: Cell, dst: Cell, jammed=frozenset()) -> l
     while path[-1] != src:
         cur = path[-1]
         path.append(
-            min(
-                (n for n in _nbrs(cur) if n in dist and dist[n] == dist[cur] - 1),
-                key=lambda n: n,
-            )
+            min(n for n in neighbors4(cur, bp.height, bp.width) if dist.get(n) == dist[cur] - 1)
         )
     return path[::-1]
-
-
-def _nbrs(c: Cell):
-    r, k = c
-    return [(r - 1, k), (r + 1, k), (r, k - 1), (r, k + 1)]
 
 
 def _mission_route(bp: Blueprint) -> list[Cell]:
@@ -80,6 +72,26 @@ def carpet_flashover(bp: Blueprint, household: Household, step: int = 2) -> list
     ]
 
 
+def hidden_dependent(bp: Blueprint, household: Household, step: int = 0) -> list[NoveltySpec]:
+    """Someone the household list does not mention (a visiting child) is hiding in the house.
+
+    Placed in the first blueprint slot the household does not use that the rescuer can reach, from
+    the start. Semi-structural: a new *person*, but expressed in the rule grammar as `occupied:<cell>`."""
+    n = len(household.dependents)
+    bp.validate(n)
+    reachable = bp.reachable(bp.agent_start)
+    for slot in bp.slots[n:]:
+        if slot in reachable:
+            return [
+                NoveltySpec(
+                    step,
+                    RulePatch(occupied_key(slot), True),
+                    f"A visiting child is hiding at {slot}.",
+                )
+            ]
+    raise ValueError(f"{bp.name}: no spare reachable dependent slot for a hidden dependent")
+
+
 def compound(bp: Blueprint, household: Household) -> list[NoveltySpec]:
     """Two different novelties at different times."""
     return door_jam(bp, household, step=1) + carpet_flashover(bp, household, step=10)
@@ -89,4 +101,17 @@ NOVELTIES: dict[str, Callable[[Blueprint, Household], list[NoveltySpec]]] = {
     "door_jam": door_jam,
     "carpet_flashover": carpet_flashover,
     "compound": compound,
+    "hidden_dependent": hidden_dependent,
 }
+
+
+def applicable(bp: Blueprint, household: Household, novelty: str | None = None) -> bool:
+    """Can this house host this household (enough slots, solvable) and this novelty? A larger household or a
+    novelty that needs a spare slot does not fit every house; callers skip those combinations rather than fail."""
+    try:
+        bp.validate(len(household.dependents))
+        if novelty:
+            NOVELTIES[novelty](bp, household)
+    except ValueError:
+        return False
+    return True

@@ -2,6 +2,7 @@
 
 The GIF is the main artifact for non-technical audiences: you can *watch* the agent decide.
 Captions under each frame carry the agent's plain-English reason for its move.
+A hidden dependent (the ``hidden_dependent`` novelty) shows as ``?`` / a hollow ringed "?" until found.
 """
 
 from __future__ import annotations
@@ -10,7 +11,7 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 
-from emberpath.world import FOLLOWING, LOST, RESCUED, WAITING, World
+from emberpath.world import FOLLOWING, LOST, RESCUED, World
 
 _FLOOR = {
     "wood": (222, 196, 160),
@@ -23,13 +24,19 @@ _WALL = (50, 50, 58)
 _BURNT = (60, 52, 48)
 _DEP_COLOR = {"dog": (140, 60, 40), "spouse": (150, 90, 200), "child": (230, 200, 50)}
 _AGENT = (40, 110, 230)
+_HIDDEN = (230, 60, 160)
 
 
 def render_ascii(world: World) -> str:
     bp = world.blueprint
     glyph: dict = {}
     for d in world.dependents:
-        glyph[d.pos] = d.profile.glyph.lower() if d.status in (FOLLOWING, RESCUED) else d.profile.glyph
+        if d.status == LOST:  # the cell shows the fire that took them
+            continue
+        if d.hiding:
+            glyph[d.pos] = "?"
+        else:
+            glyph[d.pos] = d.profile.glyph.lower() if d.status in (FOLLOWING, RESCUED) else d.profile.glyph
     lines = []
     for r in range(bp.height):
         row = []
@@ -89,6 +96,10 @@ def render_frame(world: World, caption: str = "", cell_px: int = 28, banner: str
             continue
         cx, cy = dep.pos[1] * cell_px + cell_px // 2, dep.pos[0] * cell_px + cell_px // 2
         rad = cell_px // 3
+        if dep.hiding:  # unseen by the rescuer: hollow ring with a question mark
+            d.ellipse((cx - rad, cy - rad, cx + rad, cy + rad), fill=_HIDDEN + (110,), outline=_HIDDEN, width=3)
+            d.text((cx - 3, cy - 5), "?", fill=(255, 255, 255))
+            continue
         col = _DEP_COLOR[dep.profile.kind]
         d.ellipse((cx - rad, cy - rad, cx + rad, cy + rad), fill=col, outline=(20, 20, 20))
         d.text((cx - 3, cy - 5), dep.profile.glyph, fill=(255, 255, 255))
@@ -114,4 +125,5 @@ def save_gif(frames: list[Image.Image], path: str | Path, ms_per_frame: int = 16
     if not frames:
         raise ValueError("no frames to save")
     durations = [ms_per_frame] * (len(frames) - 1) + [hold_last_ms]
-    frames[0].save(path, save_all=True, append_images=frames[1:], duration=durations, loop=0, optimize=False)
+    # optimize=True drops unused palette entries: lossless (same pixels), files ~40% smaller.
+    frames[0].save(path, save_all=True, append_images=frames[1:], duration=durations, loop=0, optimize=True)

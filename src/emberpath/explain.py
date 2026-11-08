@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from emberpath.planner import Decision
-from emberpath.rules import RulePatch, Rules, door_cell, parse_key
+from emberpath.rules import RulePatch, Rules, door_cell, key_cell, parse_key
 
 _MATERIAL_WORDS = {"wood": "Wood floors", "carpet": "Carpet", "tile": "Tile floors", "door": "Doors"}
 _KIND_WORDS = {"dog": "The dog", "spouse": "Your spouse", "child": "The children"}
@@ -21,12 +21,18 @@ def describe_patch(patch: RulePatch, before: Rules | None = None) -> str:
     if family == "spread_prob":
         was = f" (was {before.spread_prob[name]:.0%})" if before else ""
         return (
-            f"{_MATERIAL_WORDS[name]} now catch fire {float(patch.value):.0%} of the time "
+            f"{_MATERIAL_WORDS[name]} now catch{'es' if name == 'carpet' else ''} fire {float(patch.value):.0%} of the time "
             f"next to a flame{was}."
         )
+    if family == "force_prob":
+        was = f" (was {before.force_prob[name]:.0%})" if before else ""
+        return f"Forcing a jammed door now works {float(patch.value):.0%} of the time per try{was}."
     if family == "follow_prob":
         was = f" (was {before.follow_prob[name]:.0%})" if before else ""
         return f"{_KIND_WORDS[name]} now follows only {float(patch.value):.0%} of the time{was}."
+    if family == "occupied":
+        cell = key_cell(patch.key)
+        return f"Someone not on the household list is {'hiding at' if patch.value else 'no longer at'} {cell}."
     cell = door_cell(patch.key)
     return f"The door at {cell} is {'jammed shut' if patch.value else 'working again'}."
 

@@ -13,6 +13,9 @@ Policies
   stall      does nothing until the clock runs out
   suicide    walks into the nearest flame
   abandon    runs to the exit alone, never rescuing anyone
+  reward_snoop  the baseline, plus any hidden person the reward's progress signal gives away: a stand-in for a learner
+             that reads hints out of its reward. If the reward leaks nothing it plays exactly like baseline (try
+             --novelty hidden_dependent); see docs/REWARD.md.
 """
 
 from __future__ import annotations
@@ -26,7 +29,8 @@ from emberpath.blueprint import Blueprint
 from emberpath.dependents import HOUSEHOLDS
 from emberpath.grid import WAIT, action_toward, dijkstra, path_to
 from emberpath.planner import HazardAwarePlanner
-from emberpath.reward import RewardTracker
+from emberpath.reward import COMPONENTS, RewardConfig, RewardTracker
+from emberpath.rules import nominal_rules
 from emberpath.scenarios import NOVELTIES
 from emberpath.world import World
 
@@ -87,27 +91,65 @@ def abandon(world, bp):
     planner = HazardAwarePlanner(bp, world.rules)
 
     def act(obs, ev):
-        planner.belief = world.rules
+        planner.belief = dataclasses.replace(world.rules, occupied=frozenset())  # nobody to collect, hidden or not
         return planner.act(dataclasses.replace(obs, dependents=())).action
 
     return act
 
 
-POLICIES = {"oracle": oracle, "baseline": baseline, "stall": stall, "suicide": suicide, "abandon": abandon}
+def reward_snoop(world, bp):
+    planner, tracker = HazardAwarePlanner(bp, nominal_rules()), RewardTracker(world)
+
+    def phi_at(cell):  # the potential if the rescuer stood at `cell`
+        here, world.agent_pos = world.agent_pos, cell
+        phi = tracker.potential(world)
+        world.agent_pos = here
+        return phi
+
+    def act(obs, ev):
+        # The potential is highest where the "nearest waiting dependent" term vanishes: on someone the reward counts.
+        phi = {s: phi_at(s) for s in bp.slots}
+        top = max(phi.values())
+        heard = {s for s, v in phi.items() if v == top} if min(phi.values()) < top else set()
+        planner.belief = dataclasses.replace(nominal_rules(), occupied=frozenset(heard))
+        return planner.act(obs).action
+
+    return act
 
 
-def run(policy_name: str, bp: Blueprint, household, novelty: str | None, seed: int):
+POLICIES = {
+    "oracle": oracle,
+    "baseline": baseline,
+    "stall": stall,
+    "suicide": suicide,
+    "abandon": abandon,
+    "reward_snoop": reward_snoop,
+}
+
+
+def rollout(make_act, bp: Blueprint, household, novelty: str | None, seed: int, configs=(RewardConfig(),)):
+    """One episode of policy `make_act(world, bp)`. Returns (legacy return, summed components per config, world):
+    every config scores the same trajectory, so a weight sweep needs no extra episodes."""
     specs = NOVELTIES[novelty](bp, household) if novelty else []
     world = World(bp, household, seed=seed, novelties=specs, max_steps=150)
-    new, old = RewardTracker(world), LegacyReward(world)
-    act = POLICIES[policy_name](world, bp)
+    trackers, old = [RewardTracker(world, c) for c in configs], LegacyReward(world)
+    sums = [dict.fromkeys(COMPONENTS, 0.0) for _ in configs]
+    act = make_act(world, bp)
     obs, events = world.observe(), []
     while not world.done:
         res = world.step(act(obs, events))
-        new.update(world)
+        for tracker, total in zip(trackers, sums):
+            for k, v in tracker.update(world).components.items():
+                total[k] += v
         old.update(world)
         obs, events = res.obs, res.events
-    return old.total, new.total, world.outcome, world.counts()["rescued"] / max(1, world.counts()["total"])
+    return old.total, sums, world
+
+
+def run(policy_name: str, bp: Blueprint, household, novelty: str | None, seed: int):
+    old, (new,), world = rollout(POLICIES[policy_name], bp, household, novelty, seed)
+    c = world.counts()
+    return old, sum(new.values()), world.outcome, c["rescued"] / max(1, c["total"])
 
 
 def main() -> None:
@@ -159,6 +201,9 @@ def main() -> None:
             lines.append(f"ok under {label} reward: suicide ({rows['suicide'][key]:.2f}) scores below a struggling honest agent ({rows['baseline'][key]:.2f}).")
         if rows["abandon"][key] > rows["oracle"][key]:
             lines.append(f"EXPLOIT under {label} reward: abandoning outscores honest rescue.")
+    snoop_ok = rows["reward_snoop"] == rows["baseline"]
+    lines.append(("ok: reward_snoop plays exactly like baseline, so the new reward gives away no hidden person." if snoop_ok
+                  else "LEAK: reward_snoop differs from baseline, so the new reward reveals where a hidden person is."))
     out = "\n".join(lines) + "\n"
     print(out)
     (ROOT / "docs" / "reward_audit.md").write_text(out)

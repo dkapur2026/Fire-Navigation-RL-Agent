@@ -15,6 +15,7 @@ same evidence format works for every rule:
     spread_prob:<material>   chance fire jumps from a burning cell to a neighbor of this material, per tick
     follow_prob:<kind>       chance a bonded dependent (dog/spouse/child) manages to follow, per allowed tick
     door_jammed:<r>,<c>      1.0 if that door cannot be opened, else 0.0
+    force_prob:door          chance the rescuer breaks open a jammed door, per tick spent forcing it
     occupied:<r>,<c>         1.0 if an UNEXPECTED dependent (not in the declared household) is at that cell, else 0.0
 
 door_jammed and occupied are the BOOLEAN_FAMILIES: near-deterministic, patched with True/False.
@@ -30,6 +31,7 @@ DEPENDENT_KINDS = ("dog", "spouse", "child")
 # Tuned so a competent agent usually wins but a stale rulebook costs lives (see docs/ARCHITECTURE.md).
 DEFAULT_SPREAD = {"wood": 0.10, "carpet": 0.16, "tile": 0.02, "door": 0.07}
 DEFAULT_FOLLOW = {"dog": 0.70, "spouse": 0.95, "child": 0.90}
+DEFAULT_FORCE = {"door": 0.10}  # about 10 ticks to force a jammed door: a real cost to weigh against a detour
 DEFAULT_BURN_STEPS = 10
 BOOLEAN_FAMILIES = ("door_jammed", "occupied")
 
@@ -42,6 +44,8 @@ def parse_key(key: str) -> tuple[str, str]:
     if family == "spread_prob" and name in MATERIALS:
         return family, name
     if family == "follow_prob" and name in DEPENDENT_KINDS:
+        return family, name
+    if family == "force_prob" and name in DEFAULT_FORCE:
         return family, name
     if family in BOOLEAN_FAMILIES:
         try:
@@ -96,6 +100,7 @@ class RulePatch:
 class Rules:
     spread_prob: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_SPREAD))
     follow_prob: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_FOLLOW))
+    force_prob: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_FORCE))
     jammed_doors: frozenset[tuple[int, int]] = frozenset()
     occupied: frozenset[tuple[int, int]] = frozenset()  # cells holding an unexpected dependent
     burn_steps: int = DEFAULT_BURN_STEPS
@@ -107,6 +112,8 @@ class Rules:
             return self.spread_prob[name]
         if family == "follow_prob":
             return self.follow_prob[name]
+        if family == "force_prob":
+            return self.force_prob[name]
         cells = self.jammed_doors if family == "door_jammed" else self.occupied
         return 1.0 if key_cell(key) in cells else 0.0
 
@@ -116,6 +123,8 @@ class Rules:
             return replace(self, spread_prob={**self.spread_prob, name: float(patch.value)})
         if family == "follow_prob":
             return replace(self, follow_prob={**self.follow_prob, name: float(patch.value)})
+        if family == "force_prob":
+            return replace(self, force_prob={**self.force_prob, name: float(patch.value)})
         field_name = "jammed_doors" if family == "door_jammed" else "occupied"
         cells = set(getattr(self, field_name))
         cell = key_cell(patch.key)
@@ -137,6 +146,9 @@ class Rules:
         for k in DEPENDENT_KINDS:
             if self.follow_prob[k] != other.follow_prob[k]:
                 patches.append(RulePatch(f"follow_prob:{k}", other.follow_prob[k]))
+        for k in DEFAULT_FORCE:
+            if self.force_prob[k] != other.force_prob[k]:
+                patches.append(RulePatch(f"force_prob:{k}", other.force_prob[k]))
         check = doors if doors is not None else sorted(self.jammed_doors | other.jammed_doors)
         for d in check:
             if (d in self.jammed_doors) != (d in other.jammed_doors):

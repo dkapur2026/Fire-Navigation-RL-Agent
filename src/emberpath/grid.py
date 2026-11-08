@@ -5,22 +5,28 @@ from __future__ import annotations
 import heapq
 import math
 from collections import deque
-from typing import Callable, Iterable, Iterator
+from functools import lru_cache
+from typing import Callable, Iterable
 
 Cell = tuple[int, int]
 
 # Action indices. The first four are moves, in this order.
 MOVES: tuple[Cell, ...] = ((-1, 0), (1, 0), (0, -1), (0, 1))
-ACTION_NAMES: tuple[str, ...] = ("up", "down", "left", "right", "wait")
 WAIT = 4
 
 
-def neighbors4(cell: Cell, height: int, width: int) -> Iterator[Cell]:
-    r, c = cell
-    for dr, dc in MOVES:
-        nr, nc = r + dr, c + dc
-        if 0 <= nr < height and 0 <= nc < width:
-            yield (nr, nc)
+@lru_cache(maxsize=64)
+def _neighbor_table(height: int, width: int) -> dict[Cell, tuple[Cell, ...]]:
+    return {
+        (r, c): tuple((r + dr, c + dc) for dr, dc in MOVES if 0 <= r + dr < height and 0 <= c + dc < width)
+        for r in range(height)
+        for c in range(width)
+    }
+
+
+def neighbors4(cell: Cell, height: int, width: int) -> tuple[Cell, ...]:
+    """In-bounds 4-neighbours in MOVES order (a table lookup: this sits inside every BFS and Dijkstra)."""
+    return _neighbor_table(height, width)[cell]
 
 
 def manhattan(a: Cell, b: Cell) -> int:
@@ -39,15 +45,7 @@ def bfs_distances(
     source: Cell, passable: Callable[[Cell], bool], height: int, width: int
 ) -> dict[Cell, int]:
     """Unweighted shortest-path distances from `source` to every reachable cell."""
-    dist = {source: 0}
-    queue = deque([source])
-    while queue:
-        cur = queue.popleft()
-        for nxt in neighbors4(cur, height, width):
-            if nxt not in dist and passable(nxt):
-                dist[nxt] = dist[cur] + 1
-                queue.append(nxt)
-    return dist
+    return bfs_multi((source,), passable, height, width)
 
 
 def bfs_multi(

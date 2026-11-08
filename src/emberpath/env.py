@@ -2,7 +2,7 @@
 
 Observation: float32 array (H, W, C) with channels
     0 wall  1 fire  2 burnt  3 smoke  4 agent  5 waiting dependent  6 following dependent
-    7 exit  8 door  9 jammed door (only visible once bumped; here: always visible, see TODO)
+    7 exit  8 door  9 jammed door (only once the rescuer has bumped it: no hidden truth leaks)
 Actions: Discrete(5) = up, down, left, right, wait.
 Reward: see ``emberpath.reward`` and docs/REWARD.md. In short: a cost for every tick, dense progress toward the
         exit, bonuses for rescues, penalties for dependents near or touching flames. ``info["reward_components"]``
@@ -38,7 +38,7 @@ def encode(world: World) -> np.ndarray:
     x[..., 3] = np.clip(world.smoke, 0, 1)
     x[world.agent_pos + (4,)] = 1
     for d in world.dependents:
-        if d.status == WAITING:
+        if d.status == WAITING and not d.hiding:  # a hiding dependent is unseen until found
             x[d.pos + (5,)] = 1
         elif d.status == FOLLOWING:
             x[d.pos + (6,)] = 1
@@ -46,7 +46,7 @@ def encode(world: World) -> np.ndarray:
         x[cell + (7,)] = 1
     for cell in bp.doors:
         x[cell + (8,)] = 1
-    for cell in world.rules.jammed_doors:  # TODO: hide until the agent has bumped it
+    for cell in world.bumped_jams - world.broken_doors:
         x[cell + (9,)] = 1
     return x
 

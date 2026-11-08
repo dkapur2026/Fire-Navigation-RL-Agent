@@ -6,12 +6,12 @@ Two goals, in the words of the brief:
 
 Components (every step reports each one separately, see ``RewardBreakdown``):
 
-  time            -step_cost every tick. The pressure to be quick.
+  time            -step_cost every tick. The pressure to be quick. Only a full success stops this clock early.
   progress        progress_weight * (potential(s') - potential(s)). Dense "you are getting closer" signal.
   rescue          +rescue_bonus per dependent that reaches an exit.
   success         +success_bonus when everyone is out and the rescuer is at an exit.
   fire_proximity  -proximity_weight * sum over waiting/following dependents of closeness-to-fire in [0, 1).
-  fire_contact    -contact_penalty per dependent lost to flames (it touched fire).
+  fire_contact    -contact_penalty per dependent lost to flames, and per dependent still inside at a timeout.
   agent_death     if the rescuer dies: charged everything it would have paid by carrying on to the horizon.
 
 Reward-hacking defences (each has a test in tests/test_reward.py and a row in docs/REWARD.md):
@@ -26,8 +26,19 @@ Reward-hacking defences (each has a test in tests/test_reward.py and a row in do
      left behind, plus ``death_extra``. The naive "-1 on death" was cheaper than a 150-tick timeout at -0.01 a
      tick, so dying could beat trying. (Tested on static hazards, not proved: if fire later gets nearer, staying
      alive could cost more than the charge assumes, though dependents are then usually lost and charged anyway.)
+     A timeout charges ``contact_penalty`` for everyone still inside, exactly like a loss to flames. With a heavy
+     loss penalty, leaving an endangered person unreached (so they are not lost "on your watch") would otherwise
+     beat trying and failing.
+     The same holds for a dependent's loss: an episode that ends "partial" (someone lost, the rest out) is charged
+     time to the horizon, like a timeout. Otherwise letting someone burn ended the clock early, and abandoning them
+     outscored an honest rescue attempt in the hopeless `compound` fire (found by scripts/reward_sweep.py).
   4. Abandoning a dependent loses the rescue and success bonuses AND moves the agent away from the nearest
      waiting dependent, which the potential charges for.
+  5. The per-tick terms never reveal someone the rescuer cannot perceive. A hidden dependent (``Dependent.hidden``,
+     still waiting) is left out of the "nearest waiting dependent" pickup term and of ``fire_proximity``; otherwise
+     the progress signal would steer a learner straight to the hiding place (found by scripts/find_exploits.py).
+     Its exit distance stays in the potential (constant while it waits), so finding it causes no jump, and it
+     still counts in every outcome term: rescue, success, contact and the death charge.
 """
 
 from __future__ import annotations
@@ -37,7 +48,7 @@ import math
 from dataclasses import dataclass
 
 from emberpath.grid import Cell, bfs_distances, bfs_multi
-from emberpath.world import FOLLOWING, LOST, WAITING, World
+from emberpath.world import FOLLOWING, LOST, WAITING, Dependent, World
 
 COMPONENTS = (
     "time",
@@ -55,10 +66,10 @@ class RewardConfig:
     step_cost: float = 0.02
     progress_weight: float = 0.03  # per cell of potential
     rescue_bonus: float = 1.0
-    success_bonus: float = 1.0
+    success_bonus: float = 5.0  # everyone out is worth far more than the sum of single rescues
     proximity_weight: float = 0.10  # per dependent per tick at the closest non-touching distance (scaled by closeness)
     proximity_radius: int = 4  # fire this many steps away or farther costs nothing
-    contact_penalty: float = 1.0
+    contact_penalty: float = 10.0  # losing a person dwarfs every other term: no shortcut is worth a life
     death_extra: float = 1.0
 
 
@@ -79,6 +90,11 @@ def proximity(distance: int, radius: int) -> float:
     return max(0.0, (radius - distance) / radius)
 
 
+def perceived(d: Dependent) -> bool:
+    """Could the rescuer know about this dependent? Mirrors ``World.observe``: hidden ones stay unknown until found."""
+    return not d.hiding
+
+
 def mission_lower_bound(world: World) -> float:
     """Fewest steps the rescuer needs, ignoring fire and how fast anyone else moves:
     best order of visiting every dependent, then the nearest exit. inf if impossible."""
@@ -90,6 +106,8 @@ def mission_lower_bound(world: World) -> float:
 
     people = [d.pos for d in world.dependents if d.status in (WAITING, FOLLOWING)]
     from_agent = bfs_distances(world.agent_pos, passable, bp.height, bp.width)
+    if any(d.leader == d.id for d in world.dependents):  # an adult can fetch the others: only the exit is certain
+        people = []
     from_person = {p: bfs_distances(p, passable, bp.height, bp.width) for p in set(people)}
 
     def to_exit(dist: dict[Cell, int]) -> float:
@@ -132,7 +150,7 @@ class RewardTracker:
 
     def potential(self, world: World) -> float:
         """Higher = closer to done. Minus the steps the dependents still need to reach an exit, minus the steps
-        from the rescuer to the nearest dependent still waiting, minus a fixed worst value per lost dependent."""
+        from the rescuer to the nearest perceived dependent still waiting, minus a fixed worst value per lost one."""
         exit_d, d_max = self._exit_distances(world)
         bp = self.bp
         jammed = world.rules.jammed_doors
@@ -142,7 +160,7 @@ class RewardTracker:
         for d in world.dependents:
             if d.status in (WAITING, FOLLOWING):
                 phi -= exit_d.get(d.pos, lost_value)
-                if d.status == WAITING:
+                if d.status == WAITING and perceived(d):
                     waiting.append(d.pos)
             elif d.status == LOST:
                 phi -= lost_value
@@ -154,8 +172,8 @@ class RewardTracker:
         return phi
 
     def fire_proximity(self, world: World) -> float:
-        """Sum over waiting/following dependents of closeness-to-fire (unweighted), measured along walkable paths
-        (fire does not leap through walls)."""
+        """Sum over perceived waiting/following dependents of closeness-to-fire (unweighted), measured along walkable
+        paths (fire does not leap through walls)."""
         burning = world.burning_cells()
         if not burning:
             return 0.0
@@ -165,7 +183,7 @@ class RewardTracker:
         return sum(
             proximity(dist[d.pos], r)
             for d in world.dependents
-            if d.status in (WAITING, FOLLOWING) and d.pos in dist
+            if d.status in (WAITING, FOLLOWING) and d.pos in dist and perceived(d)
         )
 
     # -------------------------------------------------------------- reward
@@ -175,12 +193,16 @@ class RewardTracker:
         phi = self.potential(world)
         comp = dict.fromkeys(COMPONENTS, 0.0)
         comp["time"] = -cfg.step_cost
+        if world.outcome == "partial":  # losing someone must not stop the clock: charge time to the horizon
+            comp["time"] -= cfg.step_cost * max(0, world.max_steps - world.t)
         comp["progress"] = cfg.progress_weight * (phi - self._prev_phi)
         comp["rescue"] = cfg.rescue_bonus * (counts["rescued"] - self._prev_counts["rescued"])
         comp["success"] = cfg.success_bonus if world.outcome == "success" else 0.0
         prox = self.fire_proximity(world)
         comp["fire_proximity"] = -cfg.proximity_weight * prox
         comp["fire_contact"] = -cfg.contact_penalty * (counts["lost"] - self._prev_counts["lost"])
+        if world.outcome == "timeout":  # left inside a burning house counts as lost, so avoiding someone never pays
+            comp["fire_contact"] -= cfg.contact_penalty * sum(d.status in (WAITING, FOLLOWING) for d in world.dependents)
         if self._was_alive and not world.agent_alive:
             # Dying does not stop the meter: keep charging the per-tick rate being paid right now until the
             # horizon, plus contact for everyone left behind, plus a flat extra.
