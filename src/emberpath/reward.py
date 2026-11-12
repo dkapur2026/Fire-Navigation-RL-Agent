@@ -17,8 +17,10 @@ Components (every step reports each one separately, see ``RewardBreakdown``):
 Reward-hacking defences (each has a test in tests/test_reward.py and a row in docs/REWARD.md):
 
   1. Progress is POTENTIAL-BASED with gamma = 1. Its sum over any episode telescopes to
-     potential(end) - potential(start), so no loop or oscillation can farm it, and it cannot change which
-     policy is optimal (Ng, Harada & Russell 1999). It only makes learning easier.
+     potential(end) - potential(start), so no loop or oscillation can farm it (Ng, Harada & Russell 1999). At a
+     terminal state the distance ("work left") terms are 0 and only a fixed charge per dependent lost to flames
+     remains, so no ending earns partial credit for where people stood or which jams were never found. The only
+     outcome the shaping still separates is how many were lost to the flames, which only ever favours saving them.
   2. A lost dependent can never RAISE the potential. Without this, losing someone would delete their distance
      term and pay the agent for it. Lost dependents are held at a fixed worse-than-anything value instead.
   3. Failing early never costs less than carrying on. If the rescuer dies, the meter keeps running: it is
@@ -39,6 +41,10 @@ Reward-hacking defences (each has a test in tests/test_reward.py and a row in do
      the progress signal would steer a learner straight to the hiding place (found by scripts/find_exploits.py).
      Its exit distance stays in the potential (constant while it waits), so finding it causes no jump, and it
      still counts in every outcome term: rescue, success, contact and the death charge.
+     The same goes for jammed doors: distances in the potential treat as blocked only the jammed doors the rescuer has
+     evidence of (``known_jams``: bumped by someone, not yet forced open), never ``world.rules``. Using the true jams
+     made the progress payment drop by 0.36-0.42 the tick a door jammed, before anyone touched it, and a policy that
+     read only its own rewards could then plan around the door and match the oracle (audit ``jam_snoop``).
 """
 
 from __future__ import annotations
@@ -95,6 +101,11 @@ def perceived(d: Dependent) -> bool:
     return not d.hiding
 
 
+def known_jams(world: World) -> frozenset[Cell]:
+    """Jammed doors the rescuer could know about: someone walked into them (a door Event) and they are not forced open."""
+    return frozenset(world.bumped_jams - world.broken_doors)
+
+
 def mission_lower_bound(world: World) -> float:
     """Fewest steps the rescuer needs, ignoring fire and how fast anyone else moves:
     best order of visiting every dependent, then the nearest exit. inf if impossible."""
@@ -132,6 +143,7 @@ class RewardTracker:
         self.cfg = config or RewardConfig()
         self.bp = world.blueprint
         self._exit_cache: dict[frozenset, tuple[dict[Cell, int], int]] = {}
+        self._terminal_lost_value = 2 * self._exit_distances(world)[1]  # fixed at the start, before any jam is known
         self._prev_phi = self.potential(world)
         self._prev_counts = world.counts()
         self._was_alive = world.agent_alive
@@ -140,8 +152,8 @@ class RewardTracker:
 
     # ----------------------------------------------------------- geometry
     def _exit_distances(self, world: World) -> tuple[dict[Cell, int], int]:
-        """Steps from every walkable cell to the nearest exit (fire ignored; doors that are really jammed block)."""
-        key = frozenset(world.rules.jammed_doors)
+        """Steps from every walkable cell to the nearest exit (fire ignored; doors KNOWN to be jammed block)."""
+        key = known_jams(world)
         if key not in self._exit_cache:
             bp = self.bp
             dist = bfs_multi(bp.exits, lambda c: bp.passable(c) and c not in key, bp.height, bp.width)
@@ -150,10 +162,20 @@ class RewardTracker:
 
     def potential(self, world: World) -> float:
         """Higher = closer to done. Minus the steps the dependents still need to reach an exit, minus the steps
-        from the rescuer to the nearest perceived dependent still waiting, minus a fixed worst value per lost one."""
+        from the rescuer to the nearest perceived dependent still waiting, minus a fixed worst value per lost one.
+
+        Once the episode is over the "work left" terms are 0 and only the losses remain: minus a constant (fixed at
+        the start) per dependent lost to the flames. So the progress of every episode sums to the same
+        -potential(start), less that constant per loss, whatever the end positions or which jams were found. Without
+        it a failure kept its final distances as partial credit, and because an unfound jam keeps the distances
+        optimistic, failing without ever trying the jammed door (audit `door_shy`), or just standing still (`stall`),
+        out-scored an honest agent stuck at that door. The loss term stays because it records an outcome, not work
+        left: letting someone burn must stay worse than leaving the episode unresolved."""
+        if world.done:
+            return -self._terminal_lost_value * sum(d.status == LOST for d in world.dependents)
         exit_d, d_max = self._exit_distances(world)
         bp = self.bp
-        jammed = world.rules.jammed_doors
+        jammed = known_jams(world)  # evidence only: the true jams would tell a learner about a door before it is tried
         lost_value = 2 * d_max  # >= exit distance + pickup distance of anyone, so losing someone never helps
         phi = 0.0
         waiting: list[Cell] = []

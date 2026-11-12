@@ -28,7 +28,8 @@ from emberpath.dependents import HOUSEHOLDS, Household
 from emberpath.grid import Cell, bfs_distances, manhattan, neighbors4
 from emberpath.planner import HazardAwarePlanner
 from emberpath.rules import nominal_rules
-from emberpath.scenarios import door_jam
+from emberpath.scenarios import door_jam_single  # the legacy single jam: changing the filter would change every house
+from emberpath.world import is_fire_tick
 
 TIERS = (1, 2, 3, 4, 5)
 N_SLOTS = 3  # households of up to two people keep a spare slot for `hidden_dependent`; the family (3) fills them
@@ -127,7 +128,8 @@ def _first_fire(bp: Blueprint, horizon: int, samples: int = 24) -> np.ndarray:
     """Monte Carlo of the fire alone (it ignores the agent): tick each cell first ignites, per sample.
 
     Same dynamics as `World._spread_fire` under nominal rules (one trial per burning neighbour, cells burn
-    `burn_steps` ticks then go out), vectorised over samples. Fixed seed, so `measure` is deterministic."""
+    `burn_steps` fire turns then go out), on the world's fire clock (a turn only on fire ticks: slow at first),
+    vectorised over samples. Fixed seed, so `measure` is deterministic."""
     rules, rng = nominal_rules(), np.random.default_rng(0)
     q = np.ones((bp.height, bp.width))  # chance one burning neighbour fails to ignite the cell
     for cell, mat in bp.materials.items():
@@ -136,8 +138,13 @@ def _first_fire(bp: Blueprint, horizon: int, samples: int = 24) -> np.ndarray:
     first = np.full((samples, bp.height, bp.width), np.inf)
     for cell in bp.ignitions:
         first[:, cell[0], cell[1]] = 0
+    turn = np.where(first == 0, 0.0, np.inf)  # fire turn each cell ignited on (burn-out counts turns, not ticks)
+    k = 0
     for t in range(1, horizon + 1):
-        b = ((first <= t - 1) & (first > t - 1 - rules.burn_steps)).astype(np.int8)
+        if not is_fire_tick(t - 1):
+            continue
+        k += 1
+        b = ((turn <= k - 1) & (turn > k - 1 - rules.burn_steps)).astype(np.int8)
         if not b.any():
             break
         n = np.zeros_like(b)
@@ -145,7 +152,8 @@ def _first_fire(bp: Blueprint, horizon: int, samples: int = 24) -> np.ndarray:
         n[:, :-1] += b[:, 1:]
         n[:, :, 1:] += b[:, :, :-1]
         n[:, :, :-1] += b[:, :, 1:]
-        first[(first == np.inf) & (rng.random(first.shape) >= q**n)] = t
+        new = (first == np.inf) & (rng.random(first.shape) >= q**n)
+        first[new], turn[new] = t, k
     return first
 
 
@@ -156,7 +164,7 @@ def measure(bp: Blueprint, n: int = 2) -> dict[str, float]:
       pickup, for the best pickup order. This is what mostly makes houses fail.
     * `margin`: the largest safety margin (ticks ahead of the planner's own fire forecast) with which some
       order and route still gets everyone out; negative means the forecast fire wins every race."""
-    eta = HazardAwarePlanner(bp, nominal_rules()).fire_eta(frozenset(bp.ignitions))
+    eta = HazardAwarePlanner(bp, nominal_rules()).fire_eta(frozenset(bp.ignitions), step=0)  # from the first tick
     orders = list(itertools.permutations(bp.slots[:n]))
     adj = {c: [x for x in neighbors4(c, bp.height, bp.width) if x in bp.materials] for c in bp.materials}
     lo, hi = -64, 64  # largest feasible margin, by bisection (capped: beyond 64 the fire is irrelevant)
@@ -221,7 +229,7 @@ def generate(seed: int, tier: int = 3, max_tries: int = 2000) -> Blueprint:
         bp = Blueprint.parse(_layout(rng, tier), name=f"gen:{tier}:{seed}")
         if _acceptable(bp) and tier_of(measure(bp)) == tier:
             try:
-                door_jam(bp, _PROBE)  # some door on the mission route can jam and leave the house solvable
+                door_jam_single(bp, _PROBE)  # some door on the mission route can jam and leave the house solvable
                 return bp
             except ValueError:
                 pass

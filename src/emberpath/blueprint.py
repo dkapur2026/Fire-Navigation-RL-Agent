@@ -8,10 +8,18 @@ Legend
     1 2 3 ...  where dependent #1, #2, #3, ... start (a household uses the first n slots)
     (A, F and 1-3 sit on floor; their material is inferred from the neighbouring cells)
     F  fire starts here (floor material is inferred from the neighbouring cells)
+
+Optional metadata: any line starting with "# " (a hash and a space; no grid row can) is metadata, ignored by the
+grid. One form is understood, naming the room that contains a cell (row, column), for explanations:
+
+    # room 2,4: kitchen
+
+Rooms without a name get one from where they sit in the house ("north-west room"); see ``places.py``.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
@@ -36,6 +44,7 @@ class Blueprint:
     ignitions: tuple[Cell, ...]
     walls: frozenset[Cell]
     materials: dict[Cell, str]
+    room_names: tuple[tuple[Cell, str], ...] = ()  # optional "# room r,c: name" metadata, in file order
 
     # Cached: `passable` is the hottest call in the simulator and planner (millions per evaluation).
     @cached_property
@@ -77,6 +86,13 @@ class Blueprint:
                 out[d] = sides[0] if touching[0] > touching[1] else sides[1]
         return out
 
+    @cached_property
+    def places(self):
+        """Human names for rooms, doors and exits ("door 3", "the kitchen"); see ``places.py``."""
+        from emberpath.places import Places
+
+        return Places.of(self)
+
     def passable(self, cell: Cell) -> bool:
         return cell in self._floor
 
@@ -86,7 +102,9 @@ class Blueprint:
     # ------------------------------------------------------------------ parsing
     @classmethod
     def parse(cls, text: str, name: str = "blueprint") -> "Blueprint":
-        rows = tuple(line.rstrip("\n") for line in text.strip("\n").splitlines() if line.strip())
+        lines = [line.rstrip("\n") for line in text.strip("\n").splitlines() if line.strip()]
+        rows = tuple(line for line in lines if not line.startswith("# "))
+        room_names = _room_names(line for line in lines if line.startswith("# "))
         if not rows:
             raise ValueError("empty blueprint")
         width = len(rows[0])
@@ -139,6 +157,9 @@ class Blueprint:
             raise ValueError("need at least one exit 'E'")
         if sorted(slots) != list(range(1, len(slots) + 1)):
             raise ValueError("dependent slots must be numbered 1..n without gaps")
+        for cell, room in room_names:
+            if not (0 <= cell[0] < len(rows) and 0 <= cell[1] < width) or cell in walls or cell in doors or cell in exits:
+                raise ValueError(f"room name {room!r}: {cell} is not a room floor cell")
 
         return cls(
             name=name,
@@ -150,6 +171,7 @@ class Blueprint:
             ignitions=tuple(fires),
             walls=frozenset(walls),
             materials=materials,
+            room_names=room_names,
         )
 
     @classmethod
@@ -173,3 +195,16 @@ class Blueprint:
         for i in range(n_dependents):
             if self.slots[i] not in dist:
                 raise ValueError(f"{self.name}: dependent slot {i + 1} is unreachable")
+
+
+_ROOM_LINE = re.compile(r"^#\s+room\s+(\d+)\s*,\s*(\d+)\s*:\s*(.+?)\s*$")
+
+
+def _room_names(meta) -> tuple[tuple[Cell, str], ...]:
+    """Parse "# room r,c: name" lines; other metadata lines are comments."""
+    out = []
+    for line in meta:
+        m = _ROOM_LINE.match(line)
+        if m:
+            out.append(((int(m.group(1)), int(m.group(2))), m.group(3)))
+    return tuple(out)

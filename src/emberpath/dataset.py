@@ -161,7 +161,7 @@ def run_record(bp: Blueprint, household: str, novelty: str, agent: str, seed: in
         "schema_version": SCHEMA_VERSION, "blueprint": bp.name, "blueprint_hash": blueprint_hash(bp),
         "tier": tier(bp.name), "household": household, "seed": seed, "agent": agent,
         "privileged": agent in PRIVILEGED, "max_steps": max_steps,
-        "labels": {"novelty": novelty, "true_patches": [[s.step, s.patch.key, s.patch.value] for s in specs]},
+        "labels": {"novelty": novelty, "true_patches": [[s.step, s.patch.key, s.patch.value] for s in world.novelties]},
         "steps": steps,
         "final": {"obs": compact_obs(obs, fire, bp.width), **c},
         "outcome": world.outcome, "n_steps": world.t, "return": tracker.total,
@@ -432,6 +432,8 @@ def validate(manifest: dict, splits: dict[str, list[dict]], replay: bool = True)
             if rec["split"] != split:
                 issues.append(Issue("split_leakage", rid, f"labelled {rec['split']} but stored in {split}"))
             ref = finish(dict(rec))
+            if rec["split"] != ref["split"]:  # the split is a pure function of the group, so builds never disagree
+                issues.append(Issue("split_leakage", rid, f"labelled {rec['split']}, but its (blueprint, seed) group belongs to {ref['split']}"))
             if rec["id"] != ref["id"] or rec["content_hash"] != ref["content_hash"]:
                 issues.append(Issue("schema", rid, "id/content_hash do not match the record"))
             if rec["content_hash"] in hashes:

@@ -6,7 +6,7 @@ One tick of ``World.step(action)``:
     1. scheduled novelties (rule changes) take effect
     2. the rescuer moves
     3. dependents react (bond with the rescuer, follow, or flee fire)
-    4. fire spreads, smoke diffuses
+    4. fire spreads (on fire ticks only, see FireClock), smoke diffuses
     5. anyone standing in fire is lost; dependents standing on an exit are rescued
 
 Every random trial that tests a rule is logged as an ``Event(key, outcome)``. These events
@@ -22,13 +22,17 @@ shouts where they are), so the news always arrives, at a known time, whatever ro
 
 from __future__ import annotations
 
+import functools
+import math
+import os
 from dataclasses import dataclass, field
+from typing import Callable
 
 import numpy as np
 
 from emberpath.blueprint import Blueprint
 from emberpath.dependents import VISITOR, DependentProfile, Household
-from emberpath.grid import MOVES, WAIT, Cell, bfs_distances, manhattan, neighbors4
+from emberpath.grid import MOVES, WAIT, Cell, bfs_distances, bfs_multi, manhattan, neighbors4
 from emberpath.rules import Rules, RulePatch, door_key, key_cell, nominal_rules, occupied_key, parse_key
 
 WAITING, FOLLOWING, RESCUED, LOST = "waiting", "following", "rescued", "lost"
@@ -37,10 +41,113 @@ BASE_VISIBILITY = 6
 HEARING_RANGE = 4
 # From this tick on, a person still hiding is heard regardless of distance: late news, but news for certain.
 REVEAL_STEP = 10
-# An adult acting alone panics for PANIC_TICKS when flames come within PANIC_RADIUS or a door they try is jammed.
+# An adult acting alone panics for PANIC_TICKS when flames come within PANIC_RADIUS (walking distance: flames behind a
+# wall do not count) or a door they try is jammed.
 PANIC_TICKS = 10
 PANIC_RADIUS = 2
+# When flames come within CARRY_RADIUS of a child (walking distance: fire does not cross walls), the parent leading
+# them (the rescuer, or an adult acting alone) picks them up once beside them: they share a cell from then on, and the carrier skips every CARRY_EVERY-th tick (25% slower). Children only: a child walks
+# at half pace, so being carried is faster; the dog is quicker on its own, and carrying it cost lives.
+CARRY_RADIUS = 3
+CARRY_EVERY = 4
+RESCUER = -1  # `carried_by` value for the rescuer
+# Adults (the rescuer and a spouse) can take a few ticks in flames before they fall: each draws a tolerance in
+# BURN_TOLERANCE at the start (inclusive) and falls on that many ticks spent burning, in total. Children and the dog
+# have none; a carried child is shielded by the carrier and is lost only if the carrier falls.
+BURN_TOLERANCE = (2, 5)
 
+
+
+@dataclass(frozen=True)
+class FireClock:
+    """When the fire gets a turn: public, known physics (not a hidden rule; novelties never change it).
+
+    A fire starts slowly and then takes hold. On a *fire tick* the fire takes one full turn exactly as before (every
+    burning cell tries once to ignite each neighbour at the rule's probability, then every burning cell burns down by
+    one); on any other tick the fire does nothing at all and draws nothing from its random stream. The rate of fire
+    ticks is ``1 / slow_every`` until ``ramp_start``, rises linearly to 1 over the next ``ramp_ticks`` ticks, and is 1
+    (every tick, the old dynamics) from ``ramp_start + ramp_ticks`` on. Tick t is a fire tick when the cumulative rate
+    crosses an integer during it, so the schedule is a fixed, deterministic set of ticks: identical for every agent and
+    seed, and independent of anything the agent does.
+
+    Why fewer turns rather than a lower probability: each trial is still a Bernoulli trial at the rule's true
+    probability, so the novelty detector's evidence keeps its meaning (a slower early fire would otherwise look like
+    "carpet burns slower than believed"). Why burn-down pauses too: the whole fire runs on its own clock, so the fire
+    after n fire ticks is exactly the fire after n ticks of the old dynamics, only spread over more wall-clock ticks.
+    A forecast in fire turns (``HazardAwarePlanner.fire_rounds``) becomes ticks with ``fire_ticks_for_rounds``."""
+
+    slow_every: float = 1.0  # ticks per fire turn before ramp_start (1.0 = no slow start)
+    ramp_start: int = 0
+    ramp_ticks: int = 0
+
+    @property
+    def full_speed_from(self) -> int:
+        """First tick from which every tick is a fire tick."""
+        return 0 if self.slow_every <= 1.0 else self.ramp_start + self.ramp_ticks
+
+
+# Chosen by a sweep on training seeds 0..59 (docs/ARCHITECTURE.md, "2026-11-09: the fire starts slowly").
+DEFAULT_FIRE_CLOCK = FireClock(slow_every=3.0, ramp_start=15, ramp_ticks=30)
+
+
+def _clock_from_env() -> FireClock:
+    """``EMBERPATH_FIRE_CLOCK=off`` (the old dynamics: a fire turn every tick) or ``every,start,ramp`` (a sweep)."""
+    raw = os.environ.get("EMBERPATH_FIRE_CLOCK", "").strip()
+    if not raw:
+        return DEFAULT_FIRE_CLOCK
+    if raw == "off":
+        return FireClock()
+    every, start, ramp = raw.split(",")
+    return FireClock(float(every), int(start), int(ramp))
+
+
+FIRE_CLOCK = _clock_from_env()  # the one schedule the world, the planner, the explanations and procgen all read
+
+
+@functools.lru_cache(maxsize=16)
+def _slow_fire_ticks(clock: FireClock) -> tuple[int, ...]:
+    """The fire ticks before ``clock.full_speed_from``: ticks where the cumulative fire rate crosses an integer."""
+    end = clock.full_speed_from
+    if end == 0:
+        return ()
+    slow = 1.0 / clock.slow_every
+
+    def cum(t: float) -> float:  # integral of the rate from 0 to t
+        a = min(t, clock.ramp_start) * slow
+        if t > clock.ramp_start:
+            u = min(t, end) - clock.ramp_start
+            a += slow * u + (1.0 - slow) * u * u / (2.0 * max(1, clock.ramp_ticks))
+        return a
+
+    return tuple(t for t in range(end) if math.floor(cum(t + 1) + 1e-9) > math.floor(cum(t) + 1e-9))
+
+
+def is_fire_tick(t: int, clock: FireClock | None = None) -> bool:
+    """Does the fire take a turn on tick ``t`` (the ``World.step`` that starts with ``world.t == t``)?"""
+    clock = clock or FIRE_CLOCK
+    return t >= clock.full_speed_from or t in _slow_fire_ticks(clock)
+
+
+def fire_ticks_for_rounds(step: int, rounds: float, clock: FireClock | None = None) -> float:
+    """Ticks from an observation at ``step`` until the fire has had ``rounds`` turns (fractional: linear in between).
+
+    A forecast that counts fire turns (expected crossing times 1/p per cell, as the old every-tick fire did) becomes a
+    forecast in ticks. Exact for whole turns: the j-th fire turn after ``step`` is over ``tau_j + 1 - step`` ticks
+    later, where tau_j is its tick. The identity once ``step`` is past the slow start."""
+    clock = clock or FIRE_CLOCK
+    end = clock.full_speed_from
+    if step >= end or not math.isfinite(rounds) or rounds <= 0:
+        return rounds
+    done = [0.0] + [t + 1.0 - step for t in _slow_fire_ticks(clock) if t >= step]
+    j = int(rounds)
+    if j + 1 < len(done):
+        return done[j] + (rounds - j) * (done[j + 1] - done[j])
+    # after the slow ticks, turn number len(done) - 1 + i is over at end + i - step (one turn per tick)
+    m = len(done) - 1
+    nxt = end + 1.0 - step  # when turn m + 1 is over
+    if j == m:
+        return done[m] + (rounds - m) * (nxt - done[m])
+    return nxt + (rounds - m - 1)
 
 @dataclass(frozen=True)
 class Event:
@@ -60,6 +167,23 @@ class NoveltySpec:
     description: str = ""
 
 
+@dataclass(frozen=True)
+class SeededNovelty:
+    """A novelty whose patches depend on the episode seed (e.g. *which* doors jam). `World` resolves it once, at
+    construction, with its own seed: ``draw(seed) -> list[NoveltySpec]``. So every caller that builds a World with a
+    seed gets that seed's draw without passing the seed twice, and every agent on the same seed faces the same
+    change. `draw` must use its own random stream derived from the seed, never the world's (see scenarios.py)."""
+
+    step: int
+    draw: Callable[[int], list[NoveltySpec]]
+    description: str = ""
+
+
+def resolve_novelties(novelties, seed: int) -> list[NoveltySpec]:
+    """Concrete `NoveltySpec`s for this seed: each `SeededNovelty` replaced by its draw."""
+    return [x for n in novelties for x in (n.draw(seed) if isinstance(n, SeededNovelty) else (n,))]
+
+
 @dataclass
 class Dependent:
     id: int
@@ -69,6 +193,9 @@ class Dependent:
     hidden: bool = False  # not in the household list and out of sight until it bonds with the rescuer
     leader: int | None = None  # whom a FOLLOWING dependent follows: None = the rescuer, own id = moving on its own
     panic_left: int = 0  # ticks of panic left (adults acting alone only)
+    carried_by: int | None = None  # RESCUER or an adult's id while being carried
+    tolerance: int = 0  # ticks in flames they survive (adults only; 0 = none)
+    burns: int = 0  # ticks spent in flames so far
 
     @property
     def hiding(self) -> bool:
@@ -86,6 +213,7 @@ class DependentView:
     pace: int = 1  # moves at most once every `pace` ticks (part of the household description, not a hidden rule)
     leader: int | None = None  # None = following the rescuer; own id = an adult acting alone; else whom it follows
     panicked: bool = False  # visibly panicking: moving erratically, not toward any goal
+    carried: bool = False  # being carried by whoever leads them (shares their cell)
 
 
 @dataclass(frozen=True)
@@ -99,6 +227,8 @@ class Observation:
     smoke_at_agent: float
     visibility_radius: int | None  # None = full observability
     broken_doors: frozenset[Cell] = frozenset()  # jammed doors the rescuer has forced open (seen happen)
+    burns: int = 0  # ticks the rescuer has spent in flames so far
+    burns_left: int = 1  # more ticks in flames the rescuer can take (you know how badly you are burned)
 
 
 @dataclass
@@ -116,22 +246,23 @@ class World:
         household: Household,
         rules: Rules | None = None,
         seed: int = 0,
-        novelties: tuple[NoveltySpec, ...] | list[NoveltySpec] = (),
+        novelties: tuple[NoveltySpec | SeededNovelty, ...] | list[NoveltySpec | SeededNovelty] = (),
         max_steps: int = 150,
     ) -> None:
         blueprint.validate(len(household.dependents))
         self.blueprint = blueprint
         self.household = household
         self.rules = rules or nominal_rules()
-        self.novelties = tuple(sorted(novelties, key=lambda n: n.step))
+        self.novelties = tuple(sorted(resolve_novelties(novelties, seed), key=lambda n: n.step))
         self._pending = list(self.novelties)
         self.max_steps = max_steps
         self.t = 0
 
         # Independent random streams, so fire evolves identically for every agent given a seed.
         # spawn(3) leaves the first two streams exactly as spawn(2) made them
-        fire_ss, dep_ss, force_ss = np.random.SeedSequence(seed).spawn(3)
+        fire_ss, dep_ss, force_ss, burn_ss = np.random.SeedSequence(seed).spawn(4)
         self._force_rng = np.random.default_rng(force_ss)
+        burn_rng = np.random.default_rng(burn_ss)  # own stream: drawn once here, never shifts the fire
         self._fire_rng = np.random.default_rng(fire_ss)
         self._dep_rng = np.random.default_rng(dep_ss)
 
@@ -146,12 +277,15 @@ class World:
 
         self.agent_pos: Cell = blueprint.agent_start
         self.agent_alive = True
+        self.agent_tolerance = int(burn_rng.integers(BURN_TOLERANCE[0], BURN_TOLERANCE[1] + 1))
+        self.agent_burns = 0
         self.dependents = [
             Dependent(i, prof, blueprint.slots[i]) for i, prof in enumerate(household.dependents)
         ]
         for d in self.dependents:
-            if d.profile.autonomous:  # adults set off on their own from the first tick
+            if d.profile.autonomous:  # adults set off on their own from the first tick, and can take some fire
                 d.status, d.leader = FOLLOWING, d.id
+                d.tolerance = int(burn_rng.integers(BURN_TOLERANCE[0], BURN_TOLERANCE[1] + 1))
         self._unused_slots = blueprint.slots[len(household.dependents):]
         self.novelty_log: list[tuple[int, RulePatch]] = []
         self.bumped_jams: set[Cell] = set()  # jammed doors someone has walked into (observable)
@@ -195,7 +329,7 @@ class World:
             burning=frozenset(c for c in self.burning_cells() if visible(c)),
             burnt=frozenset(c for c in self.burnt_cells() if visible(c)),
             dependents=tuple(
-                DependentView(d.id, d.profile.kind, d.profile.name, d.pos, d.status, d.profile.move_period, d.leader, d.panic_left > 0)
+                DependentView(d.id, d.profile.kind, d.profile.name, d.pos, d.status, d.profile.move_period, d.leader, d.panic_left > 0, d.carried_by is not None)
                 for d in self.dependents
                 if (visible(d.pos) and not d.hiding)
                 or d.status in (FOLLOWING, RESCUED)
@@ -203,6 +337,8 @@ class World:
             smoke_at_agent=float(self.smoke[self.agent_pos]),
             visibility_radius=radius,
             broken_doors=frozenset(self.broken_doors),
+            burns=self.agent_burns,
+            burns_left=self.agent_tolerance - self.agent_burns,
         )
 
     # -------------------------------------------------------------------- tick
@@ -214,8 +350,8 @@ class World:
         # 1. novelties
         self._apply_due_novelties()
 
-        # 2. rescuer moves
-        if action != WAIT:
+        # 2. rescuer moves (a rescuer carrying someone sits out every CARRY_EVERY-th tick)
+        if action != WAIT and not (self._carrying(RESCUER) and self.t % CARRY_EVERY == CARRY_EVERY - 1):
             dr, dc = MOVES[action]
             target = (self.agent_pos[0] + dr, self.agent_pos[1] + dc)
             if self.blueprint.passable(target):
@@ -240,16 +376,27 @@ class World:
         self._listen(events)
         self._update_dependents(events)
 
-        # 4. environment
-        self._spread_fire(events)
+        # 4. environment: the fire takes its turn only on fire ticks (FireClock); smoke drifts every tick
+        if is_fire_tick(self.t):
+            self._spread_fire(events)
         self._update_smoke()
 
-        # 5. consequences
+        # 5. consequences: adults fall once their burns reach their tolerance; a carried child shares the carrier's fate
         if self.burn[self.agent_pos] > 0:
-            self.agent_alive = False
+            self.agent_burns += 1
+            self.agent_alive = self.agent_burns < self.agent_tolerance
         for d in self.dependents:
-            if d.status in (WAITING, FOLLOWING):
+            if d.status in (WAITING, FOLLOWING) and d.carried_by is None:
                 if self.burn[d.pos] > 0:
+                    d.burns += 1
+                    if d.burns >= d.tolerance:
+                        d.status = LOST
+                elif d.pos in self.blueprint.exits:
+                    d.status = RESCUED
+        for d in self.dependents:
+            if d.status == FOLLOWING and d.carried_by is not None:
+                carrier_down = not self.agent_alive if d.carried_by == RESCUER else self.dependents[d.carried_by].status == LOST
+                if carrier_down:
                     d.status = LOST
                 elif d.pos in self.blueprint.exits:
                     d.status = RESCUED
@@ -285,18 +432,50 @@ class World:
                 events.append(Event(self.t, occupied_key(slot), slot in calling))
 
     # ------------------------------------------------------------- dependents
+    def _carrying(self, carrier: int) -> bool:
+        return any(d.carried_by == carrier and d.status == FOLLOWING for d in self.dependents)
+
+    def _sync_carried(self) -> None:
+        for d in self.dependents:
+            if d.carried_by is not None and d.status == FOLLOWING:
+                d.pos = self.agent_pos if d.carried_by == RESCUER else self.dependents[d.carried_by].pos
+
+    def fire_steps(self, max_depth: int | None = CARRY_RADIUS) -> dict[Cell, int]:
+        """Walking distance from the nearest flame to each cell, within `max_depth` (fire does not cross walls). Every
+        "how close is the fire" rule in the world (carrying, panic, the dog bolting) uses this, never Manhattan."""
+        bp = self.blueprint
+        return bfs_multi(self.burning_cells(), bp.passable, bp.height, bp.width, max_depth=max_depth)
+
+    def _pick_up(self, active: list[Dependent], burning: frozenset[Cell]) -> None:
+        """A parent beside a child they lead, with flames within CARRY_RADIUS of the child, picks the child up
+        (the one nearest the fire, if several)."""
+        if not burning:
+            return
+        near = self.fire_steps()
+        carriers = [(RESCUER, None, self.agent_pos)] + [(a.id, a.id, a.pos) for a in active if a.leader == a.id]
+        for cid, leads, pos in carriers:
+            if self._carrying(cid):
+                continue
+            kids = [d for d in active if d.status == FOLLOWING and d.leader == leads and d.carried_by is None
+                    and d.profile.kind == "child" and d.pos in near and manhattan(d.pos, pos) <= 1]
+            if kids:
+                child = min(kids, key=lambda d: near[d.pos])
+                child.carried_by, child.pos = cid, pos
+
     def _update_dependents(self, events: list[Event]) -> None:
         active = [d for d in self.dependents if d.status in (WAITING, FOLLOWING)]
         if not active:
             return
         bp = self.blueprint
         burning = self.burning_cells()
+        self._sync_carried()  # the rescuer has moved
         adults = [d for d in active if d.leader == d.id]
         for a in adults:  # reached by the rescuer (before or after their own move): calm down and go with them
             if manhattan(a.pos, self.agent_pos) > 1:
                 self._move_adult(a, burning, events)
             if manhattan(a.pos, self.agent_pos) <= 1:
                 a.leader, a.panic_left = None, 0
+        self._sync_carried()  # and so have the adults
         adults = [a for a in adults if a.leader == a.id]
         for d in active:
             if d.status != WAITING:
@@ -307,18 +486,23 @@ class World:
                 a = next((a for a in adults if a.status == FOLLOWING and manhattan(d.pos, a.pos) <= 1), None)
                 if a:
                     d.status, d.leader = FOLLOWING, a.id
-        for d in active:  # a follower whose adult is gone (out or lost) follows the rescuer instead
-            if d.leader not in (None, d.id) and self.dependents[d.leader].status != FOLLOWING:
-                d.leader = None
-
-        leaders = {d.leader for d in active if d.status == FOLLOWING and d.leader != d.id}
+        leaders = {d.leader for d in active if d.status == FOLLOWING and d.leader not in (None, d.id)}
         dist_to = {  # followers move toward their leader; nobody else needs a search
-            ld: bfs_distances(self.agent_pos if ld is None else self.dependents[ld].pos, self._walkable, bp.height, bp.width)
-            for ld in leaders
+            ld: bfs_distances(self.dependents[ld].pos, self._walkable, bp.height, bp.width) for ld in leaders
         }
         for d in active:
+            # An adult who got out stands at their exit, so their followers keep heading there. Only if the adult was
+            # lost, or that exit is cut off, do the followers turn to the rescuer instead.
+            if d.status == FOLLOWING and d.leader not in (None, d.id) and (
+                self.dependents[d.leader].status == LOST or d.pos not in dist_to[d.leader]
+            ):
+                d.leader = None
+        if any(d.status == FOLLOWING and d.leader is None for d in active):
+            dist_to[None] = bfs_distances(self.agent_pos, self._walkable, bp.height, bp.width)
+        away: dict[Cell, int] | None = None  # walking distance from the flames, computed only if the dog needs it
+        for d in active:
             if d.status == FOLLOWING and d.leader != d.id:
-                if self.t % d.profile.move_period != 0:
+                if self.t % d.profile.move_period != 0 or d.carried_by is not None:
                     continue
                 dist_to_agent = dist_to[d.leader]
                 here = dist_to_agent.get(d.pos)
@@ -336,24 +520,27 @@ class World:
                 if succeeded:
                     d.pos = min(options, key=lambda n: dist_to_agent[n])
             elif d.profile.flees_fire and burning:
-                near = min(manhattan(d.pos, b) for b in burning)
-                if near <= 2 and self._dep_rng.random() < d.profile.flee_prob:
+                if away is None:
+                    away = self.fire_steps(None)
+                if away.get(d.pos, 1 << 30) <= 2 and self._dep_rng.random() < d.profile.flee_prob:
                     options = [
                         n
                         for n in neighbors4(d.pos, bp.height, bp.width)
                         if self._walkable(n) and n not in burning
                     ]
                     if options:
-                        d.pos = max(options, key=lambda n: min(manhattan(n, b) for b in burning))
+                        d.pos = max(options, key=lambda n: away.get(n, 1 << 30))
+        self._pick_up(active, burning)
 
     def _move_adult(self, a: Dependent, burning: frozenset[Cell], events: list[Event]) -> None:
         """An adult acting alone walks toward the nearest waiting child they know about, else the nearest exit.
         They know the floor plan, not the hidden rules: a jammed door is found by walking into it, which the
         rescuer sees (a door Event, shared in `bumped_jams`). Deterministic, so it never touches the fire RNG."""
-        if self.t % a.profile.move_period != 0:
+        if self.t % a.profile.move_period != 0 or (self._carrying(a.id) and self.t % CARRY_EVERY == CARRY_EVERY - 1):
             return
         bp = self.blueprint
-        if not a.panic_left and any(manhattan(a.pos, b) <= PANIC_RADIUS for b in burning):
+        hot = bfs_multi(burning, bp.passable, bp.height, bp.width, max_depth=PANIC_RADIUS)  # walking, as fire spreads
+        if not a.panic_left and a.pos in hot:
             a.panic_left = PANIC_TICKS
         if a.panic_left:  # erratic: stay or step anywhere open, goal forgotten (dependents' RNG, not the fire's)
             a.panic_left -= 1
@@ -365,7 +552,7 @@ class World:
             return bp.passable(c) and c not in burning and (c not in self.bumped_jams or c in self.broken_doors)
 
         def clear(c: Cell) -> bool:  # keeps out of panic range of the flames
-            return open_(c) and all(manhattan(c, b) > PANIC_RADIUS for b in burning)
+            return open_(c) and c not in hot
 
         for ok in (clear, open_):  # stay clear of the fire if any goal allows it, else take the direct way
             here = bfs_distances(a.pos, ok, bp.height, bp.width)

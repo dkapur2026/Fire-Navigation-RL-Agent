@@ -7,9 +7,9 @@ import sys
 from pathlib import Path
 
 from emberpath.blueprint import Blueprint
-from emberpath.agents import AGENTS
+from emberpath.agents import AGENTS, make_agent
 from emberpath.dependents import HOUSEHOLDS, Household
-from emberpath.evaluate import evaluate, gap_closed, run_episode, run_lifelong, summarize, write_csv
+from emberpath.evaluate import gap_closed, run_episode, run_lifelong, summarize, write_csv
 from emberpath.explain import describe_patch
 from emberpath.rules import nominal_rules
 from emberpath.procgen import from_spec, generate, measure
@@ -44,6 +44,29 @@ def _setup(a: argparse.Namespace) -> tuple[Blueprint, Household]:
     return bp, hh
 
 
+# Learned agents: need `pip install -e .[rl]` and a checkpoint from scripts/train_ppo.py (see docs/RL.md).
+RL_AGENTS = ("ppo", "ppo_sampled", "dreamer", "dreamer_sampled")  # dreamer: scripts/train_dreamer.py
+
+
+def _agent(name: str, a: argparse.Namespace, seed: int):
+    """A registered agent name, or for a learned agent a factory over the checkpoint (loaded once)."""
+    if name not in RL_AGENTS:
+        return name
+    if not getattr(a, "checkpoint", None):
+        raise SystemExit(f"--agent {name} needs --checkpoint PATH (train one with scripts/train_ppo.py)")
+    if name.startswith("dreamer"):
+        from emberpath.dreamer import dreamer_factory, load_dreamer
+
+        if getattr(a, "_dreamer", None) is None:
+            a._dreamer = load_dreamer(a.checkpoint)
+        return dreamer_factory(a._dreamer, greedy=name == "dreamer", max_steps=a.max_steps, seed=seed)
+    from emberpath.rl_baseline import load_policy, ppo_factory
+
+    if getattr(a, "_policy", None) is None:
+        a._policy = load_policy(a.checkpoint)[0]
+    return ppo_factory(a._policy, greedy=name == "ppo", max_steps=a.max_steps, seed=seed)
+
+
 def cmd_list(_: argparse.Namespace) -> int:
     print("households:")
     for h in HOUSEHOLDS.values():
@@ -74,23 +97,35 @@ def cmd_run(a: argparse.Namespace) -> int:
     bp, hh = _setup(a)
     frames: list = []
     lines: list[str] = []
+    agents: list = []  # the agent, kept so its explanations can be printed at the end
+    noticed: list[tuple[int, str]] = []  # (tick, what the agent noticed and is doing), for the GIF banner
 
     def record(world: World, decision) -> None:
+        if decision is not None and decision.explanation and agents:
+            exps = [e for e in getattr(agents[0], "explanations", ()) if e.step == world.t - 1 and e.plan]
+            if exps:  # a change of mind (a surprise dismissed as bad luck does not take over the banner)
+                noticed.append((world.t - 1, exps[-1].headline))
         if a.gif:
             cap = decision.reason if decision else "Start"
-            frames.append(render_frame(world, caption=cap, banner=_banner(world)))
+            frames.append(render_frame(world, caption=cap, banner=_banner(world, noticed), banner_lines=GIF_BANNER_LINES))
         if decision and not a.quiet:
-            lines.append(f"t={world.t:>3}  {decision.reason}")
+            lines.append(f"t={world.t - 1:>3}  {decision.reason}")  # the tick the decision was made
         if a.ascii and decision:
             print(f"--- t={world.t} ---\n{render_ascii(world)}")
 
-    res = run_episode(bp, hh, a.agent, a.novelty, a.seed, a.max_steps, record=record)
+    agent = _agent(a.agent, a, a.seed)
+    if isinstance(agent, str):
+        name = agent
+        agent = lambda bp_, world_: agents.append(make_agent(name, bp_, world_)) or agents[-1]  # noqa: E731
+    res = run_episode(bp, hh, agent, a.novelty, a.seed, a.max_steps, record=record)
     last = None
     for line in lines:  # collapse repeated reasons for readability
         body = line.split("  ", 1)[1]
         if body != last:
             print(line)
         last = body
+    if agents and hasattr(agents[0], "explanations"):
+        print("\n" + "\n".join(explanation_report(agents[0].explanations)))
     print(f"\n{hh.label} / {a.agent} / novelty={a.novelty or 'none'} / seed={a.seed}")
     print(f"outcome: {res.outcome.upper()}   rescued {res.rescued}/{res.total}   steps {res.steps}   score {res.score:.2f}")
     if a.gif:
@@ -99,10 +134,36 @@ def cmd_run(a: argparse.Namespace) -> int:
     return 0
 
 
-def _banner(world: World) -> str:
+GIF_BANNER_LINES = 4  # `emberpath run` GIFs: room for an explanation under the caption
+
+
+def explanation_report(explanations) -> list[str]:
+    """The end-of-run explanation log: every change of mind in plain words, then the numbers behind them."""
+    out = ["Explanation log (what I noticed and what I did about it):"]
+    if not explanations:
+        out.append("  Nothing I saw contradicted what I expected; I kept my starting beliefs all the way.")
+    for e in explanations:
+        out.append(f"  t={e.step:>3}  {e.text}")
+    out.append("Technical details:")
+    if not any(e.appendix for e in explanations):
+        out.append("  No rule was flagged by the detector.")
+    for e in explanations:
+        out.extend(f"  t={e.step:>3}  {line}" for line in e.appendix)
+    return out
+
+
+def _banner(world: World, noticed: list[tuple[int, str]] | None = None) -> str:
+    """The orange line under the caption. Once the agent has noticed a change: what it noticed and is doing, and when
+    the change really happened. Before that (and for agents that never explain): only when the truth changed."""
+    truth = [step for step, _ in world.novelty_log]
+    if noticed:
+        step, text = noticed[-1]
+        when = [t for t in truth if t <= step]
+        really = f" (the world really changed at t={when[-1]})" if when else ""
+        return f"NOTICED at t={step}{really}: {text}"
     if world.novelty_log:
         step, patch = world.novelty_log[-1]
-        return f"[truth changed at t={step}: {describe_patch(patch)}]"
+        return f"[truth changed at t={step}: {describe_patch(patch, blueprint=world.blueprint)}]"
     return ""
 
 
@@ -139,9 +200,10 @@ def cmd_improve(a: argparse.Namespace) -> int:
 
 def cmd_eval(a: argparse.Namespace) -> int:
     bp, hh = _setup(a)
-    results = evaluate(bp, hh, a.agents, a.novelty, range(a.seeds), a.max_steps)
+    seeds = range(a.seed_start, a.seed_start + a.seeds)
+    results = [run_episode(bp, hh, _agent(ag, a, s), a.novelty, s, a.max_steps) for ag in a.agents for s in seeds]
     summ = summarize(results)
-    print(f"{a.blueprint} / {a.profile} / novelty={a.novelty or 'none'} / {a.seeds} seeds\n")
+    print(f"{a.blueprint} / {a.profile} / novelty={a.novelty or 'none'} / seeds {seeds.start}..{seeds.stop - 1}\n")
     print(f"{'agent':<10}{'success':>9}{'score':>8}{'return':>9}{'effic.':>8}{'steps':>8}{'died':>7}{'timeout':>9}")
     for agent, s in summ.items():
         eff = "n/a" if s["mean_efficiency"] != s["mean_efficiency"] else f"{s['mean_efficiency']:.2f}"
@@ -170,7 +232,8 @@ def main(argv: list[str] | None = None) -> int:
 
     r = sub.add_parser("run", help="run one episode")
     common(r)
-    r.add_argument("--agent", default="baseline", choices=list(AGENTS))
+    r.add_argument("--agent", default="baseline", choices=[*AGENTS, *RL_AGENTS])
+    r.add_argument("--checkpoint", default=None, help="checkpoint for --agent ppo / dreamer (and _sampled)")
     r.add_argument("--seed", type=int, default=0)
     r.add_argument("--gif", default=None, help="write an animated GIF here")
     r.add_argument("--ascii", action="store_true", help="print every frame as text")
@@ -188,8 +251,10 @@ def main(argv: list[str] | None = None) -> int:
 
     e = sub.add_parser("eval", help="compare agents over many seeds")
     common(e)
-    e.add_argument("--agents", nargs="+", default=["baseline", "oracle"], choices=list(AGENTS))
+    e.add_argument("--agents", nargs="+", default=["baseline", "oracle"], choices=[*AGENTS, *RL_AGENTS])
     e.add_argument("--seeds", type=int, default=30)
+    e.add_argument("--seed-start", type=int, default=0, help="first seed (PPO is held out on 1000..1099)")
+    e.add_argument("--checkpoint", default=None, help="checkpoint for ppo / dreamer (and _sampled)")
     e.add_argument("--csv", default=None)
     e.set_defaults(fn=cmd_eval)
 

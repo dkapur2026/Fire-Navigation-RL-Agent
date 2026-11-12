@@ -18,7 +18,7 @@ from dataclasses import replace
 from typing import Protocol
 
 from emberpath.blueprint import Blueprint
-from emberpath.explain import DecisionLog, describe_patch
+from emberpath.explain import DecisionLog, Explanation, describe_patch, explain_adaptation, plan_with, technical_appendix
 from emberpath.novelty import BetaBernoulliDetector, Finding, NoveltyDetector
 from emberpath.planner import Decision, HazardAwarePlanner
 from emberpath.repair import RepairResult, RepairSearch
@@ -93,6 +93,7 @@ class AdaptiveAgent:
         detector: NoveltyDetector | None = None,
         repairer: Repairer | None = None,
         belief: Rules | None = None,  # start from beliefs learned in earlier episodes (see `lessons`)
+        explain: bool = True,  # False: terse one-line notes, no route comparison (same actions either way)
     ):
         self.belief: Rules = belief or nominal_rules()
         self.planner = HazardAwarePlanner(blueprint, self.belief)
@@ -104,23 +105,39 @@ class AdaptiveAgent:
         self.log = DecisionLog()
         self._seen: dict[str, int] = {}  # key -> evidence count when the repairer last looked at it
         self._dismissed: set[tuple[str, float]] = set()  # (key, believed) surprises judged to be bad luck
+        self.explain = explain
+        self.explanations: list[Explanation] = []  # every change of mind, explained (plain text + appendix)
+        self._tally: dict[str, list[int]] = {}  # key -> [times it happened, times it was tried], own evidence only
 
     def act(self, obs: Observation, events: list[Event]) -> Decision:
-        note = ""
+        note, pending = "", None
         if events:  # findings can only change when evidence arrives
             self.all_events.extend(events)
+            for e in events:
+                c = self._tally.setdefault(e.key, [0, 0])
+                c[0] += e.outcome
+                c[1] += 1
             self.detector.observe(events)
             findings = self.detector.findings()
             if any(f.n_trials > self._seen.get(f.key, 0) for f in findings):
-                note = self._repair(obs.step, findings)
+                note, pending = self._repair(obs, findings)
         decision = self.planner.act(obs)
+        if pending is not None:  # explain with both plans in hand: what I was doing, and what I do now
+            before, result, old_plan, findings = pending
+            evidence = {k: (s, n) for k, (s, n) in self._tally.items()}
+            exp = explain_adaptation(self.planner.bp, obs, before, result, old_plan, decision, self.planner,
+                                     findings, evidence)
+            self.explanations.append(exp)
+            note = exp.text
         if note:
-            decision = replace(decision, reason=f"{note} {decision.reason}")
+            decision = replace(decision, reason=f"{note} {decision.reason}", explanation=note)
         self.log.add(obs.step, decision)
         return decision
 
-    def _repair(self, step: int, findings: list[Finding]) -> str:
-        """Repair the belief from every current finding; return what to tell the human."""
+    def _repair(self, obs: Observation, findings: list[Finding]):
+        """Repair the belief from every current finding. Returns (note for the human, or "", and, when explaining,
+        what explain_adaptation needs once the new plan is made: (old belief, result, old plan, findings))."""
+        step = obs.step
         self.repairs += 1
         self._seen.update((f.key, f.n_trials) for f in findings)
         before = self.belief
@@ -128,18 +145,27 @@ class AdaptiveAgent:
         if not result.patches:  # say so once per (rule, belief), not on every further surprising tick
             new = {(f.key, f.believed) for f in findings} - self._dismissed
             self._dismissed |= new
-            return "Something surprised me, but it looks like bad luck; keeping my beliefs." if new else ""
+            if not new:
+                return "", None
+            note = "Something surprised me, but it looks like bad luck; keeping my beliefs."
+            if self.explain:
+                evidence = {k: (s, n) for k, (s, n) in self._tally.items()}
+                self.explanations.append(Explanation(step, note, appendix=technical_appendix(findings, result, evidence)))
+            return note, None
+        old_plan = plan_with(self.planner, before, obs) if self.explain else None
         self.belief = self.planner.belief = result.rules
         self.detector.reset_belief(self.belief)
         self.patches.extend((step, p) for p in result.patches)
+        if self.explain:
+            return "", (before, result, old_plan, findings)
         changed = " ".join(describe_patch(p, before) for p in result.patches)
         if not result.ambiguous:
-            return f"Updating my beliefs: {changed}"
+            return f"Updating my beliefs: {changed}", None
         alt = " ".join(describe_patch(p, before) for p in result.runner_up) or "nothing has changed (bad luck)"
         return (
             f"I think this changed: {changed} But \"{alt}\" would explain what I saw almost as well "
             f"(margin {result.runner_up_margin:.1f}); acting on my best guess."
-        )
+        ), None
 
 
     def lessons(self) -> Rules:
@@ -156,8 +182,8 @@ class NaiveRepairAgent(AdaptiveAgent):
 
     name = "naive_repair"
 
-    def __init__(self, blueprint: Blueprint, world: World | None = None):
-        super().__init__(blueprint, repairer=PosteriorMeanRepair())
+    def __init__(self, blueprint: Blueprint, world: World | None = None, explain: bool = True):
+        super().__init__(blueprint, repairer=PosteriorMeanRepair(), explain=explain)
 
 
 AGENTS = {

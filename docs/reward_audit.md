@@ -6,16 +6,20 @@ the median shows the typical episode.
 
 | policy | legacy (mean) | new (mean) | new (median) | fraction rescued | outcomes |
 |---|---|---|---|---|---|
-| oracle | 1.84 | 2.05 | 5.47 | 0.85 | agent_lost 2/20, partial 1/20, success 17/20 |
-| baseline | -1.66 | -14.73 | -14.55 | 0.00 | agent_lost 1/20, partial 4/20, timeout 15/20 |
-| stall | -1.82 | -14.79 | -14.55 | 0.00 | agent_lost 2/20, timeout 18/20 |
-| suicide | -1.24 | -15.20 | -14.09 | 0.00 | agent_lost 20/20 |
-| abandon | -1.24 | -14.68 | -14.55 | 0.00 | partial 11/20, timeout 9/20 |
-| reward_snoop | -1.66 | -14.73 | -14.55 | 0.00 | agent_lost 1/20, partial 4/20, timeout 15/20 |
+| oracle | 2.28 | 4.40 | 5.44 | 0.95 | partial 1/20, success 19/20 |
+| baseline | -1.66 | -14.03 | -14.19 | 0.00 | partial 4/20, timeout 16/20 |
+| adaptive | 1.71 | 1.47 | 5.39 | 0.80 | partial 4/20, success 16/20 |
+| stall | -1.81 | -14.08 | -14.19 | 0.00 | agent_lost 1/20, timeout 19/20 |
+| suicide | -1.30 | -13.91 | -13.37 | 0.00 | agent_lost 20/20 |
+| abandon | -1.31 | -14.03 | -14.19 | 0.00 | partial 11/20, timeout 9/20 |
+| reward_snoop | -1.66 | -14.03 | -14.19 | 0.00 | partial 4/20, timeout 16/20 |
+| door_shy | -1.66 | -14.03 | -14.19 | 0.00 | partial 4/20, timeout 16/20 |
+| jam_snoop | -1.66 | -14.03 | -14.19 | 0.00 | partial 4/20, timeout 16/20 |
 
-Ranking under legacy reward: oracle > abandon > suicide > baseline > reward_snoop > stall
-Ranking under new reward:    oracle > abandon > baseline > reward_snoop > stall > suicide
+Ranking under legacy reward: oracle > adaptive > suicide > abandon > baseline > reward_snoop > door_shy > jam_snoop > stall
+Ranking under new reward:    oracle > adaptive > suicide > baseline > abandon > reward_snoop > door_shy > jam_snoop > stall
 
-EXPLOIT under legacy reward: suicide (-1.24) outscores a struggling honest agent (-1.66).
-ok under new reward: suicide (-15.20) scores below a struggling honest agent (-14.73).
+EXPLOIT under legacy reward: suicide (-1.30) outscores a struggling honest agent (-1.66).
+EXPLOIT under new reward: suicide (-13.91) outscores a struggling honest agent (-14.03).
 ok: reward_snoop plays exactly like baseline, so the new reward gives away no hidden person.
+ok: jam_snoop plays exactly like baseline, so the new reward gives away no unfound jammed door.

@@ -195,6 +195,28 @@ def paired_bootstrap(
     return point, float(lo), float(hi)
 
 
+def step_ratio(
+    results: list[EpisodeResult], agent: str = "adaptive", ref: str = "oracle", n_boot: int = 2000, seed: int = 0
+) -> tuple[float, float, float, int]:
+    """(point, lo, hi, n): ``agent``'s steps / ``ref``'s steps, over the n seeds where BOTH got everyone out.
+
+    Only joint successes count, so no agent looks quick by leaving someone behind or dying early. A ratio of
+    sums (not a mean of ratios), so one short episode cannot dominate. 1.0 = as fast as ``ref``; the oracle is
+    the same planner with the true rules, not a proven shortest rescue, so values below 1.0 are possible."""
+    steps: dict[str, dict[int, int]] = {}
+    for r in results:
+        if r.outcome == "success":
+            steps.setdefault(r.agent, {})[r.seed] = r.steps
+    seeds = sorted(set(steps.get(agent, {})) & set(steps.get(ref, {})))
+    if not seeds:
+        return math.nan, math.nan, math.nan, 0
+    a = np.array([steps[agent][s] for s in seeds], float)
+    b = np.array([steps[ref][s] for s in seeds], float)
+    idx = np.random.default_rng(seed).integers(0, len(seeds), (n_boot, len(seeds)))
+    lo, hi = np.percentile(a[idx].sum(axis=1) / b[idx].sum(axis=1), [2.5, 97.5])
+    return float(a.sum() / b.sum()), float(lo), float(hi), len(seeds)
+
+
 def gap_ratio(agent: str = "adaptive") -> Callable[[dict[str, np.ndarray]], np.ndarray]:
     """``gap_closed`` as a vectorised bootstrap statistic (nan where the oracle gap is ~0)."""
 

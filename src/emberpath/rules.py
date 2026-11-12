@@ -29,7 +29,7 @@ MATERIALS = ("wood", "carpet", "tile", "door")
 DEPENDENT_KINDS = ("dog", "spouse", "child")
 
 # Tuned so a competent agent usually wins but a stale rulebook costs lives (see docs/ARCHITECTURE.md).
-DEFAULT_SPREAD = {"wood": 0.10, "carpet": 0.16, "tile": 0.02, "door": 0.07}
+DEFAULT_SPREAD = {"wood": 0.10, "carpet": 0.16, "tile": 0.15, "door": 0.07}  # tile: 0.02 -> 0.12 -> 0.25 -> 0.15
 DEFAULT_FOLLOW = {"dog": 0.70, "spouse": 0.95, "child": 0.90}
 DEFAULT_FORCE = {"door": 0.10}  # about 10 ticks to force a jammed door: a real cost to weigh against a detour
 DEFAULT_BURN_STEPS = 10

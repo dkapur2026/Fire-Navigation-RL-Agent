@@ -2,6 +2,7 @@
 
     python scripts/false_alarms.py             # 30 seeds x every household
     python scripts/false_alarms.py --seeds 10  # quicker
+    python scripts/false_alarms.py --blueprint house
 
 Each episode is driven by BaselineAgent (it never changes its belief, so the event stream does not depend on
 the detector) and recorded once; the per-tick event batches are then replayed into a fresh detector for each
@@ -24,8 +25,8 @@ from emberpath.blueprint import Blueprint
 from emberpath.dependents import HOUSEHOLDS
 from emberpath.novelty import BetaBernoulliDetector
 from emberpath.rules import nominal_rules, parse_key
-from emberpath.scenarios import NOVELTIES
-from emberpath.world import Event, World
+from emberpath.scenarios import NOVELTIES, applicable
+from emberpath.world import Event, World, resolve_novelties
 
 ROOT = Path(__file__).resolve().parents[1]
 THRESHOLDS = (2.0, 3.0, 4.0, 6.0, 8.0, 10.0)
@@ -44,7 +45,7 @@ def rollout(bp: Blueprint, household: str, novelty: str | None, seed: int) -> tu
         res = world.step(agent.act(obs, events).action)
         obs, events = res.obs, res.events
         batches.append(events)
-    return batches, {s.patch.key: s.step for s in specs}
+    return batches, {s.patch.key: s.step for s in resolve_novelties(specs, seed)}  # a SeededNovelty draws per seed
 
 
 def first_flags(batches: list[list[Event]], threshold: float, decay: float) -> dict[str, int]:
@@ -68,16 +69,17 @@ def _first_trial(batches: list[list[Event]], key: str, since: int) -> int | None
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--seeds", type=int, default=30)
+    ap.add_argument("--blueprint", default="ranch")
     args = ap.parse_args()
-    bp = Blueprint.from_file(ROOT / "blueprints" / "ranch.txt")
+    bp = Blueprint.from_file(ROOT / "blueprints" / f"{args.blueprint}.txt")
     t0 = time.perf_counter()
     runs = {
-        nov: [rollout(bp, hh, nov, s) for hh in HOUSEHOLDS for s in range(args.seeds)]
+        nov: [rollout(bp, hh, nov, s) for hh in HOUSEHOLDS if applicable(bp, HOUSEHOLDS[hh], nov) for s in range(args.seeds)]
         for nov in (None, *NOVELTIES)
     }
     sim = time.perf_counter() - t0
     n_ep = len(runs[None])
-    print(f"ranch, BaselineAgent, {n_ep} episodes per scenario ({len(HOUSEHOLDS)} households x {args.seeds} seeds)")
+    print(f"{args.blueprint}, BaselineAgent, {n_ep} episodes on quiet worlds ({len(HOUSEHOLDS)} households x {args.seeds} seeds; novelties skip households the house cannot host)")
     print(f"default detector: threshold={DEFAULT.threshold}, min_trials={DEFAULT.min_trials}, decay={DEFAULT.decay}\n")
 
     print("False alarms on quiet worlds (any finding at any tick, peeking every tick)")

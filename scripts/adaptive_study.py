@@ -28,7 +28,7 @@ from emberpath.blueprint import Blueprint
 from emberpath.dependents import HOUSEHOLDS
 from emberpath.evaluate import EpisodeResult, gap_ratio, paired_bootstrap, run_episode
 from emberpath.rules import nominal_rules
-from emberpath.scenarios import NOVELTIES
+from emberpath.scenarios import NOVELTIES, applicable
 from make_results import MIN_GAP, PROFILES, ROOT, ci
 from make_results import NOVELTIES as SCENARIOS
 
@@ -88,11 +88,13 @@ def main() -> None:
     ap.add_argument("--out", default=str(ROOT / "docs" / "adaptive_study.md"))
     a = ap.parse_args()
     bp = ranch()
-    specs = {(p, n): NOVELTIES[n](bp, HOUSEHOLDS[p]) for p in PROFILES for n in SCENARIOS if n}
+    # every household x novelty the ranch can host (family_dog has no spare slot for a hidden visitor)
+    cells = [(p, n) for p in PROFILES for n in SCENARIOS if applicable(bp, HOUSEHOLDS[p], n)]
+    specs = {(p, n): NOVELTIES[n](bp, HOUSEHOLDS[p]) for p, n in cells if n}
 
     t0 = time.perf_counter()
     with ProcessPoolExecutor(os.cpu_count()) as pool:
-        evals = list(pool.map(eval_job, [(p, n, a.seeds) for p in PROFILES for n in SCENARIOS]))
+        evals = list(pool.map(eval_job, [(p, n, a.seeds) for p, n in cells]))
         lags = list(pool.map(lag_job, [(p, n, k, a.lag_seeds) for (p, n) in specs for k in LAGS]))
     wall = time.perf_counter() - t0
 

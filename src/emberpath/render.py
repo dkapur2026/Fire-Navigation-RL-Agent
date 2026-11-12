@@ -3,10 +3,14 @@
 The GIF is the main artifact for non-technical audiences: you can *watch* the agent decide.
 Captions under each frame carry the agent's plain-English reason for its move.
 A hidden dependent (the ``hidden_dependent`` novelty) shows as ``?`` / a hollow ringed "?" until found.
+Doors carry their number (``places.py``: reading order), so "door 3" in an explanation can be found on the picture.
+The banner under the caption wraps onto up to ``banner_lines`` lines; the CLI uses it to show, from the tick the
+agent noticed a change, what it noticed and what it is doing about it.
 """
 
 from __future__ import annotations
 
+import textwrap
 from pathlib import Path
 
 from PIL import Image, ImageDraw
@@ -62,12 +66,24 @@ def render_ascii(world: World) -> str:
     return "\n".join(lines)
 
 
-def render_frame(world: World, caption: str = "", cell_px: int = 28, banner: str = "") -> Image.Image:
+def wrap_banner(text: str, width_chars: int, lines: int) -> list[str]:
+    """Wrap `text` to at most `lines` lines of `width_chars`; an overflow ends in '...'."""
+    out = textwrap.wrap(text, max(10, width_chars)) or [""]
+    if len(out) > lines:
+        out = out[:lines]
+        out[-1] = out[-1][: max(0, width_chars - 3)].rstrip() + "..."
+    return out
+
+
+def render_frame(world: World, caption: str = "", cell_px: int = 28, banner: str = "", banner_lines: int = 1) -> Image.Image:
+    """One frame. The frame height depends on `banner_lines` only, so every frame of a GIF made with one value has
+    the same size."""
     bp = world.blueprint
     w, h = bp.width * cell_px, bp.height * cell_px
-    foot = 54
+    foot = 54 + 14 * (max(1, banner_lines) - 1)
     img = Image.new("RGB", (w, h + foot), (24, 24, 28))
     d = ImageDraw.Draw(img, "RGBA")
+    numbers = bp.places.door_numbers
 
     for r in range(bp.height):
         for c in range(bp.width):
@@ -82,6 +98,8 @@ def render_frame(world: World, caption: str = "", cell_px: int = 28, banner: str
                 d.rectangle(box, fill=(120, 30, 30))
                 d.line((x0 + 4, y0 + 4, x0 + cell_px - 5, y0 + cell_px - 5), fill=(255, 255, 255), width=3)
                 d.line((x0 + cell_px - 5, y0 + 4, x0 + 4, y0 + cell_px - 5), fill=(255, 255, 255), width=3)
+            if cell in numbers and world.burn[cell] == 0:
+                d.text((x0 + 2, y0 + 1), str(numbers[cell]), fill=(255, 255, 255))
             if world.burn[cell] < 0:
                 d.rectangle(box, fill=_BURNT)
             elif world.burn[cell] > 0:
@@ -117,7 +135,9 @@ def render_frame(world: World, caption: str = "", cell_px: int = 28, banner: str
     d.text((8, h + 6), status, fill=(235, 235, 235))
     d.text((8, h + 22), caption[: w // 6], fill=(170, 210, 255))
     if banner:
-        d.text((8, h + 38), banner[: w // 6], fill=(255, 190, 90))
+        lines = [banner[: w // 6]] if banner_lines <= 1 else wrap_banner(banner, w // 6, banner_lines)
+        for i, line in enumerate(lines):
+            d.text((8, h + 38 + 14 * i), line, fill=(255, 190, 90))
     return img
 
 

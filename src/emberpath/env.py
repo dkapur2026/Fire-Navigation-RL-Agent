@@ -3,10 +3,16 @@
 Observation: float32 array (H, W, C) with channels
     0 wall  1 fire  2 burnt  3 smoke  4 agent  5 waiting dependent  6 following dependent
     7 exit  8 door  9 jammed door (only once the rescuer has bumped it: no hidden truth leaks)
+    10 time remaining: (max_steps - t) / max_steps on every cell (the rescuer knows the clock; without it a
+       deterministic policy cannot tell tick 3 from tick 90 in the same layout and loops, see docs/RL.md)
 Actions: Discrete(5) = up, down, left, right, wait.
 Reward: see ``emberpath.reward`` and docs/REWARD.md. In short: a cost for every tick, dense progress toward the
         exit, bonuses for rescues, penalties for dependents near or touching flames. ``info["reward_components"]``
         holds the per-component breakdown for every step.
+Episode end: every ending (success, partial, agent_lost, timeout) is ``terminated``; ``truncated`` is always False,
+        because the 150-tick horizon is part of the reward (see ``step``). ``info["outcome"]`` says which ending it was.
+Info: nothing the rescuer could not perceive. Mid-episode ``info["total"]`` counts only dependents that are not hiding;
+        the true counts, ``efficiency`` and ``episode_return`` are added once the episode is over.
 """
 
 from __future__ import annotations
@@ -25,7 +31,8 @@ try:
 except ImportError:  # pragma: no cover
     gym = None
 
-N_CHANNELS = 10
+N_CHANNELS = 11
+TIME_CHANNEL = 10
 
 
 def encode(world: World) -> np.ndarray:
@@ -48,6 +55,7 @@ def encode(world: World) -> np.ndarray:
         x[cell + (8,)] = 1
     for cell in world.bumped_jams - world.broken_doors:
         x[cell + (9,)] = 1
+    x[..., TIME_CHANNEL] = max(0, world.max_steps - world.t) / max(1, world.max_steps)
     return x
 
 
@@ -83,14 +91,19 @@ if gym is not None:
             w = self.world
             res = w.step(int(action))
             breakdown = self.tracker.update(w)
-            terminated = w.outcome in ("success", "partial", "agent_lost")
-            truncated = w.outcome == "timeout"
+            # The horizon is part of the task, not an outside time limit: the reward charges contact for everyone
+            # left inside at a timeout (and time to the horizon on a loss), and the world cannot step past it. So a
+            # timeout TERMINATES; bootstrapping from it (as `truncated` would invite) would charge those people twice.
+            terminated = w.done
+            truncated = False
             info = {
                 "events": res.events,
                 "reward_components": breakdown.components,
                 **res.info,
             }
-            if w.done:
+            if not w.done:  # mid-episode, count only the people the rescuer could know about (as World.observe does)
+                info["total"] = sum(not d.hiding for d in w.dependents)
+            else:
                 info["efficiency"] = self.tracker.efficiency(w)
                 info["episode_return"] = self.tracker.total
             return encode(w), breakdown.total, terminated, truncated, info

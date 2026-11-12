@@ -85,3 +85,8 @@ across splits, impossible reward, too long, wrong outcome, dropped field, bad ty
 * Oracle records are `privileged`: imitating them teaches a policy to act on information it cannot see (it walks
   straight to a hidden child). Filter on `privileged` for evidence-only training.
 * Dropping duplicates makes per-agent counts unequal; compare agents with `evaluate.py`, not by counting records.
+
+**Reward version note (final verification, 2026-11).** The progress potential's distance terms are now 0 at every
+terminal state (docs/REWARD.md, "The end-of-episode potential"). A dataset built before that change records a
+different final-step `progress` (and return) for every episode that did not end in success, so `replay` will
+correctly report it as built by a different code version. Rebuild such datasets; no dataset is committed to the repo.

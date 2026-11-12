@@ -10,24 +10,37 @@ and add a policy here for every new exploit you think of.
 Policies
   oracle     honest, knows the true rules (usually succeeds)
   baseline   honest, but its rulebook is stale (stuck at the jammed door, times out)
+  adaptive   honest, learns from what it sees (finds the jam by bumping it, then repairs its rulebook)
   stall      does nothing until the clock runs out
   suicide    walks into the nearest flame
   abandon    runs to the exit alone, never rescuing anyone
   reward_snoop  the baseline, plus any hidden person the reward's progress signal gives away: a stand-in for a learner
              that reads hints out of its reward. If the reward leaks nothing it plays exactly like baseline (try
              --novelty hidden_dependent); see docs/REWARD.md.
+  door_shy   the baseline, but it never tries a door that is really jammed (it cheats to know which) and waits there
+             instead, so the jam is never found. With an evidence-only potential an unfound jam keeps the potential
+             optimistic, so this tests whether "not looking" pays: it must stay below every honest agent that looks
+             and succeeds, and (since the distance terms of the potential are 0 at every ending) it must not beat
+             the honest baseline stuck at the door either (docs/REWARD.md).
+  jam_snoop  the baseline, plus any jammed door the reward's progress signal gives away before the rescuer has bumped
+             it. It sees only what a learner fed its own rewards would: each tick's progress payment. It checks
+             which "door d is jammed" hypothesis explains that payment from the observed positions, and once "no
+             hidden jam" is ruled out it plans around the door. If the potential uses only jams the rescuer has
+             found, "no hidden jam" is never ruled out and it plays exactly like baseline.
 """
 
 from __future__ import annotations
 
 import argparse
 import dataclasses
+import copy
+from types import SimpleNamespace
 from pathlib import Path
 
-from emberpath.agents import BaselineAgent, OracleAgent
+from emberpath.agents import AdaptiveAgent, BaselineAgent, OracleAgent
 from emberpath.blueprint import Blueprint
 from emberpath.dependents import HOUSEHOLDS
-from emberpath.grid import WAIT, action_toward, dijkstra, path_to
+from emberpath.grid import MOVES, WAIT, action_toward, dijkstra, path_to
 from emberpath.planner import HazardAwarePlanner
 from emberpath.reward import COMPONENTS, RewardConfig, RewardTracker
 from emberpath.rules import nominal_rules
@@ -62,6 +75,25 @@ def oracle(world, bp):
 def baseline(world, bp):
     agent = BaselineAgent(bp, world)
     return lambda obs, ev: agent.act(obs, ev).action
+
+
+def adaptive(world, bp):
+    agent = AdaptiveAgent(bp)
+    return lambda obs, ev: agent.act(obs, ev).action
+
+
+def door_shy(world, bp):
+    agent = BaselineAgent(bp, world)
+
+    def act(obs, ev):
+        a = agent.act(obs, ev).action
+        if a != WAIT:
+            dr, dc = MOVES[a]
+            if (obs.agent_pos[0] + dr, obs.agent_pos[1] + dc) in world.rules.jammed_doors:  # an exploit may cheat
+                return WAIT
+        return a
+
+    return act
 
 
 def stall(world, bp):
@@ -117,13 +149,57 @@ def reward_snoop(world, bp):
     return act
 
 
+def jam_snoop(world, bp):
+    """See the module docstring. Reads ONLY the progress payment (what a reward-fed learner sees) plus observable state
+    (positions, its own bump events, broken doors); the hypothetical potentials are computed on a stand-in world whose
+    jam set is the hypothesis, never on world.rules."""
+    planner, paid, w = HazardAwarePlanner(bp, nominal_rules()), RewardTracker(world), RewardConfig().progress_weight
+    probe = RewardTracker(world)
+    found: set = set()
+    candidates: set | None = None  # doors that could explain every hint so far; None = "no hidden jam" still fits
+    prev = None
+
+    def phi(snapshot, jams):
+        pos, deps, _ = snapshot
+        stand_in = SimpleNamespace(blueprint=bp, agent_pos=pos, dependents=deps, bumped_jams=set(jams), broken_doors=set(), done=False,
+                                   rules=dataclasses.replace(nominal_rules(), jammed_doors=frozenset(jams)))
+        return probe.potential(stand_in)
+
+    def act(obs, ev):
+        nonlocal candidates, prev
+        for e in ev:
+            if e.outcome and e.key.startswith("door_jammed:"):
+                found.add(tuple(int(x) for x in e.key.split(":")[1].split(",")))
+        known = frozenset(found - set(obs.broken_doors))
+        now = (world.agent_pos, tuple(copy.copy(d) for d in world.dependents), known)  # observable in door_jam
+        if prev is not None:
+            got = paid.update(world).components["progress"]  # what the learner is paid this tick
+
+            def fits(before: set, after: set) -> bool:  # payment if the hidden jam set went from `before` to `after`
+                return abs(w * (phi(now, now[2] | after) - phi(prev, prev[2] | before)) - got) < 1e-9
+
+            if candidates is None:
+                if not fits(set(), set()):  # "no hidden jam" no longer explains the payment: some door just jammed
+                    candidates = {d for d in bp.doors if d not in known and fits(set(), {d})}
+            elif candidates:
+                candidates = {d for d in candidates if fits({d}, {d})} or candidates
+        prev = now
+        planner.belief = dataclasses.replace(nominal_rules(), jammed_doors=frozenset(candidates or ()))
+        return planner.act(obs).action
+
+    return act
+
+
 POLICIES = {
     "oracle": oracle,
     "baseline": baseline,
+    "adaptive": adaptive,
     "stall": stall,
     "suicide": suicide,
     "abandon": abandon,
     "reward_snoop": reward_snoop,
+    "door_shy": door_shy,
+    "jam_snoop": jam_snoop,
 }
 
 
@@ -199,11 +275,21 @@ def main() -> None:
             lines.append(f"EXPLOIT under {label} reward: suicide ({rows['suicide'][key]:.2f}) outscores a struggling honest agent ({rows['baseline'][key]:.2f}).")
         else:
             lines.append(f"ok under {label} reward: suicide ({rows['suicide'][key]:.2f}) scores below a struggling honest agent ({rows['baseline'][key]:.2f}).")
+        if rows["door_shy"][key] > min(rows["oracle"][key], rows["adaptive"][key]):
+            lines.append(f"EXPLOIT under {label} reward: never finding the jam (door_shy) outscores honest agents that find it.")
+        if label == "new":  # (the legacy reward is kept only to show its suicide loophole)
+            for shortcut in ("stall", "door_shy"):
+                if rows[shortcut][key] > rows["baseline"][key] + 1e-9:
+                    lines.append(f"EXPLOIT under {label} reward: {shortcut} ({rows[shortcut][key]:.2f}) outscores the honest "
+                                 f"agent stuck at the jammed door ({rows['baseline'][key]:.2f}).")
         if rows["abandon"][key] > rows["oracle"][key]:
             lines.append(f"EXPLOIT under {label} reward: abandoning outscores honest rescue.")
     snoop_ok = rows["reward_snoop"] == rows["baseline"]
     lines.append(("ok: reward_snoop plays exactly like baseline, so the new reward gives away no hidden person." if snoop_ok
                   else "LEAK: reward_snoop differs from baseline, so the new reward reveals where a hidden person is."))
+    jam_ok = rows["jam_snoop"] == rows["baseline"]
+    lines.append(("ok: jam_snoop plays exactly like baseline, so the new reward gives away no unfound jammed door." if jam_ok
+                  else "LEAK: jam_snoop differs from baseline, so the new reward reveals a jammed door before it is bumped."))
     out = "\n".join(lines) + "\n"
     print(out)
     (ROOT / "docs" / "reward_audit.md").write_text(out)

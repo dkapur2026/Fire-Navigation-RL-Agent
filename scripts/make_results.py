@@ -18,7 +18,7 @@ from pathlib import Path
 
 from emberpath.blueprint import Blueprint
 from emberpath.dependents import HOUSEHOLDS
-from emberpath.evaluate import evaluate, gap_ratio, paired_bootstrap
+from emberpath.evaluate import evaluate, gap_ratio, paired_bootstrap, step_ratio
 from emberpath.scenarios import applicable
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -58,23 +58,35 @@ def main() -> None:
         "`gap closed` = (adaptive - baseline) / (oracle - baseline); `n/a` when the oracle gap is under "
         f"{MIN_GAP:.2f}. Brackets: 95% paired-bootstrap intervals over seeds. Regenerate with `make results`;",
         "ablations, detection delays and recovery curves: `python scripts/adaptive_study.py` (docs/adaptive_study.md).",
+        "`efficiency (o / a)` = fewest possible steps (ignoring fire and child pace) / steps taken, mean over each "
+        "agent's own successes.",
+        "`steps vs oracle` = adaptive steps / oracle steps over the n seeds where BOTH got everyone out (1.00 = as "
+        "fast as the oracle,",
+        "higher = slower). The oracle is the same planner given the true rules, not a proven shortest rescue.",
         "",
-        "| household | novelty | baseline | oracle | oracle gap | adaptive | adaptive - baseline | gap closed | all out (b / o / a) |",
-        "|---|---|---|---|---|---|---|---|---|",
+        "| household | novelty | baseline | oracle | oracle gap | adaptive | adaptive - baseline | gap closed | all out (b / o / a) "
+        "| efficiency (o / a) | steps vs oracle |",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for profile, novelty, res in out:
         if res is None:
-            lines.append(f"| {profile} | {novelty or 'none'} | n/a: the house cannot host this (too few slots) |||||||")
+            lines.append(f"| {profile} | {novelty or 'none'} | n/a: the house cannot host this (too few slots) |||||||||")
             continue
         ok = {ag: sum(r.outcome == "success" for r in res if r.agent == ag) / a.seeds for ag in AGENTS}
         mean = {ag: paired_bootstrap(res, lambda m, ag=ag: m[ag]) for ag in AGENTS}
         gap = mean["oracle"][0] - mean["baseline"][0]
         lift = paired_bootstrap(res, lambda m: m["adaptive"] - m["baseline"])
         closed = ci(*paired_bootstrap(res, gap_ratio()), pct=True) if gap >= MIN_GAP else "n/a"
+        eff = {ag: [r.efficiency for r in res if r.agent == ag and r.efficiency is not None]
+               for ag in ("oracle", "adaptive")}
+        eff = {ag: f"{sum(v) / len(v):.2f}" if v else "n/a" for ag, v in eff.items()}
+        sr, slo, shi, sn = step_ratio(res)
+        steps = f"{sr:.2f} [{slo:.2f}, {shi:.2f}] (n={sn})" if sn else "n/a"
         lines.append(
             f"| {profile} | {novelty or 'none'} | {mean['baseline'][0]:.2f} | {mean['oracle'][0]:.2f} | {gap:+.2f} "
             f"| {ci(*mean['adaptive'])} | {lift[0]:+.2f} [{lift[1]:+.2f}, {lift[2]:+.2f}] | {closed} "
-            f"| {ok['baseline']:.0%} / {ok['oracle']:.0%} / {ok['adaptive']:.0%} |"
+            f"| {ok['baseline']:.0%} / {ok['oracle']:.0%} / {ok['adaptive']:.0%} "
+            f"| {eff['oracle']} / {eff['adaptive']} | {steps} |"
         )
 
     path = ROOT / "docs" / ("results.md" if a.blueprint == "ranch" else f"results_{a.blueprint}.md")
